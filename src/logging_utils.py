@@ -67,8 +67,10 @@ def compute_aggregate(run_records):
     """Return a dict of aggregated statistics across runs."""
     df     = pd.DataFrame(run_records)
     method = df['method'].iloc[0] if len(df) > 0 else 'unknown'
+    n_runs = len(df)
     return {
         'method':                 method,
+        'n_runs':                 n_runs,
         'mean_best_val_auc':      df['best_val_auc'].mean(),
         'std_best_val_auc':       df['best_val_auc'].std(ddof=1),
         'mean_best_test_auc':     df['best_test_auc'].mean(),
