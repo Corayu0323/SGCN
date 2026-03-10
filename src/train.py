@@ -28,14 +28,9 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
     # Manual iterator is used to time each batch fetch (sampling_time) separately
     # from the forward/backward pass without restructuring the training loop.
     loader_iter = iter(dataloader)
-    while True:
-        _cuda_sync(device)
+    for _ in range(len(dataloader)):
         t_sample = time.time()
-        try:
-            batch = next(loader_iter)
-        except StopIteration:
-            break
-        _cuda_sync(device)
+        batch = next(loader_iter)
         sampling_time += time.time() - t_sample
 
         batch      = batch.to(device)
