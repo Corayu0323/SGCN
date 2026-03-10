@@ -10,12 +10,34 @@ from torch_geometric.loader import NeighborLoader
 from .utils import add_labels, gen_model
 
 
+def _cuda_sync(device):
+    """Synchronize CUDA if available to get accurate timing boundaries."""
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
 def train_epoch(model, dataloader, criterion, optimizer, device,
                 use_labels=False, n_classes=112):
     model.train()
     loss_sum, total = 0, 0
+    sampling_time   = 0.0
 
-    for batch in dataloader:
+    _cuda_sync(device)
+    epoch_start = time.time()
+
+    # Manual iterator is used to time each batch fetch (sampling_time) separately
+    # from the forward/backward pass without restructuring the training loop.
+    loader_iter = iter(dataloader)
+    while True:
+        _cuda_sync(device)
+        t_sample = time.time()
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            break
+        _cuda_sync(device)
+        sampling_time += time.time() - t_sample
+
         batch      = batch.to(device)
         batch_size = batch.batch_size
 
@@ -35,7 +57,10 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
         loss_sum += loss.item() * batch_size
         total    += batch_size
 
-    return loss_sum / total
+    _cuda_sync(device)
+    epoch_time = time.time() - epoch_start
+
+    return loss_sum / total, epoch_time, sampling_time
 
 
 @torch.no_grad()
@@ -44,6 +69,9 @@ def evaluate(model, dataloader, labels, train_idx, val_idx, test_idx,
     model.eval()
     preds      = torch.zeros(labels.shape, device=device)
     eval_times = 1
+
+    _cuda_sync(device)
+    eval_start = time.time()
 
     for _ in range(eval_times):
         for batch in dataloader:
@@ -61,6 +89,9 @@ def evaluate(model, dataloader, labels, train_idx, val_idx, test_idx,
 
     preds /= eval_times
 
+    _cuda_sync(device)
+    eval_time = time.time() - eval_start
+
     train_loss = criterion(preds[train_idx], labels[train_idx].float()).item()
     val_loss   = criterion(preds[val_idx],   labels[val_idx].float()).item()
     test_loss  = criterion(preds[test_idx],  labels[test_idx].float()).item()
@@ -71,6 +102,7 @@ def evaluate(model, dataloader, labels, train_idx, val_idx, test_idx,
         evaluator(preds[test_idx],  labels[test_idx]),
         train_loss, val_loss, test_loss,
         preds,
+        eval_time,
     )
 
 
@@ -108,22 +140,40 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         optimizer, mode='max', factor=0.75, patience=50, verbose=True
     )
 
-    total_time = 0
     best_val_score, final_test_score = 0, 0
-    val_score  = 0
-    final_pred = None
+    val_score, test_score = 0, 0
+    final_pred  = None
+    epoch_records = []
+
+    _cuda_sync(device)
+    run_start = time.time()
 
     for epoch in range(1, n_epochs + 1):
-        tic  = time.time()
-        loss = train_epoch(model, train_loader, criterion, optimizer, device, use_labels, n_classes)
-        toc  = time.time()
-        total_time += toc - tic
+        loss, epoch_time, sampling_time = train_epoch(
+            model, train_loader, criterion, optimizer, device, use_labels, n_classes
+        )
+
+        record = {
+            'epoch':               epoch,
+            'train_loss':          loss,
+            'val_auc':             float('nan'),
+            'test_auc':            float('nan'),
+            'train_sampling_time': sampling_time,
+            'train_epoch_time':    epoch_time,
+            'eval_time':           float('nan'),
+        }
 
         if epoch == n_epochs or epoch % eval_every == 0 or epoch % log_every == 0:
-            train_score, val_score, test_score, train_loss, val_loss, test_loss, pred = evaluate(
+            (train_score, val_score, test_score,
+             train_loss, val_loss, test_loss,
+             pred, eval_time) = evaluate(
                 model, eval_loader, labels, train_idx, val_idx, test_idx,
                 criterion, evaluator_wrapper, device, use_labels, n_classes
             )
+
+            record['val_auc']   = val_score
+            record['test_auc']  = test_score
+            record['eval_time'] = eval_time
 
             if val_score > best_val_score:
                 best_val_score   = val_score
@@ -141,10 +191,21 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                     f'Best Test: {100 * final_test_score:.2f}%'
                 )
 
+        epoch_records.append(record)
         lr_scheduler.step(val_score)
+
+    _cuda_sync(device)
+    total_run_time = time.time() - run_start
 
     if save_pred and final_pred is not None:
         os.makedirs('./output', exist_ok=True)
         torch.save(torch.sigmoid(final_pred), f'./output/{n_running}.pt')
 
-    return best_val_score, final_test_score
+    return {
+        'best_val_auc':   best_val_score,
+        'best_test_auc':  final_test_score,
+        'final_val_auc':  val_score,
+        'final_test_auc': test_score,
+        'total_run_time': total_run_time,
+        'epoch_records':  epoch_records,
+    }
