@@ -5,7 +5,7 @@ from torch_geometric.nn import GCNConv, SAGEConv
 
 
 class GNN_PyG(nn.Module):
-    """Multi-layer GNN (PyG backend) supporting sage / gcn."""
+    """Multi-layer GNN (PyG backend) supporting sage / gcn / graphsaint."""
 
     def __init__(
         self,
@@ -35,7 +35,9 @@ class GNN_PyG(nn.Module):
         for i in range(n_layers):
             if mpnn == 'sage':
                 self.convs.append(SAGEConv(n_hidden, n_hidden))
-            else:  # gcn
+            else:  # gcn / graphsaint
+                # GraphSAINT uses standard GCN convolution; its key difference
+                # is subgraph-level sampling during training (handled in train.py).
                 self.convs.append(GCNConv(n_hidden, n_hidden, add_self_loops=False))
 
             self.norms.append(nn.BatchNorm1d(n_hidden))
