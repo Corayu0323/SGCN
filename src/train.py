@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch_geometric.loader import NeighborLoader
+from torch_geometric.loader import NeighborLoader, GraphSAINTRandomWalkSampler
 
 from .utils import add_labels, gen_model
 
@@ -58,6 +58,62 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
     return loss_sum / total, epoch_time, sampling_time
 
 
+def train_epoch_saint(model, dataloader, criterion, optimizer, device,
+                      train_idx, use_labels=False, n_classes=112):
+    """Training epoch using GraphSAINT subgraph-sampling batches.
+
+    Unlike NeighborLoader batches (which separate seed nodes from context
+    neighbors), GraphSAINT batches are induced subgraphs where every node
+    may be a training node.  We identify the training nodes within each
+    subgraph via ``batch.n_id`` and compute the loss only over them.
+    """
+    model.train()
+    train_idx_device = train_idx.to(device)
+    loss_sum, total = 0, 0
+    sampling_time   = 0.0
+
+    _cuda_sync(device)
+    epoch_start = time.time()
+
+    loader_iter = iter(dataloader)
+    for _ in range(len(dataloader)):
+        t_sample = time.time()
+        batch = next(loader_iter)
+        sampling_time += time.time() - t_sample
+
+        batch = batch.to(device)
+
+        # Identify which nodes in this subgraph belong to the training set.
+        train_mask = torch.isin(batch.n_id, train_idx_device)
+        if train_mask.sum() == 0:
+            continue
+
+        if use_labels:
+            # Reveal labels for non-training nodes only (same convention as
+            # train_epoch, where seed-node labels are withheld).
+            non_train_local_idx = torch.where(~train_mask)[0]
+            x = add_labels(batch.x, batch.train_labels_onehot,
+                           non_train_local_idx, n_classes, device)
+        else:
+            x = batch.x
+
+        pred = model(x, batch.edge_index, batch.edge_attr)
+        loss = criterion(pred[train_mask], batch.y[train_mask].float())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        n_train_in_batch = train_mask.sum().item()
+        loss_sum += loss.item() * n_train_in_batch
+        total    += n_train_in_batch
+
+    _cuda_sync(device)
+    epoch_time = time.time() - epoch_start
+
+    return (loss_sum / total if total > 0 else 0.0), epoch_time, sampling_time
+
+
 @torch.no_grad()
 def evaluate(model, dataloader, labels, train_idx, val_idx, test_idx,
              criterion, evaluator, device, use_labels=False, n_classes=112):
@@ -103,21 +159,35 @@ def evaluate(model, dataloader, labels, train_idx, val_idx, test_idx,
 
 def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         gen_model_fn, device, n_layers, lr, weight_decay, n_epochs,
-        eval_every, log_every, save_pred, use_labels=False, n_classes=112):
+        eval_every, log_every, save_pred, use_labels=False, n_classes=112,
+        mpnn='gcn'):
     evaluator_wrapper = lambda pred, lbls: evaluator.eval(
         {'y_pred': pred, 'y_true': lbls}
     )['rocauc']
 
     train_batch_size = (len(train_idx) + 9) // 10
 
-    train_loader = NeighborLoader(
-        data,
-        num_neighbors=[16] * n_layers,
-        batch_size=train_batch_size,
-        input_nodes=train_idx.cpu(),
-        shuffle=True,
-        num_workers=4,
-    )
+    if mpnn == 'graphsaint':
+        # GraphSAINT: sample random-walk-induced subgraphs instead of
+        # per-node neighborhoods.  num_steps mirrors the ~10 batches/epoch
+        # produced by NeighborLoader, and walk_length provides a 2-hop reach.
+        saint_num_steps = max(len(train_idx) // train_batch_size, 1)
+        train_loader = GraphSAINTRandomWalkSampler(
+            data,
+            batch_size=train_batch_size,
+            walk_length=2,
+            num_steps=saint_num_steps,
+            num_workers=4,
+        )
+    else:
+        train_loader = NeighborLoader(
+            data,
+            num_neighbors=[16] * n_layers,
+            batch_size=train_batch_size,
+            input_nodes=train_idx.cpu(),
+            shuffle=True,
+            num_workers=4,
+        )
 
     eval_loader = NeighborLoader(
         data,
@@ -144,9 +214,15 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     run_start = time.time()
 
     for epoch in range(1, n_epochs + 1):
-        loss, epoch_time, sampling_time = train_epoch(
-            model, train_loader, criterion, optimizer, device, use_labels, n_classes
-        )
+        if mpnn == 'graphsaint':
+            loss, epoch_time, sampling_time = train_epoch_saint(
+                model, train_loader, criterion, optimizer, device,
+                train_idx, use_labels, n_classes
+            )
+        else:
+            loss, epoch_time, sampling_time = train_epoch(
+                model, train_loader, criterion, optimizer, device, use_labels, n_classes
+            )
 
         record = {
             'epoch':               epoch,
