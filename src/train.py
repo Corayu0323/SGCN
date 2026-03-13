@@ -1,4 +1,5 @@
 import os
+import random
 import time
 
 import torch
@@ -6,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.loader import NeighborLoader, GraphSAINTRandomWalkSampler
+from torch_geometric.utils import subgraph as pyg_subgraph
 
 from .utils import add_labels, gen_model
 
@@ -14,6 +16,274 @@ def _cuda_sync(device):
     """Synchronize CUDA if available to get accurate timing boundaries."""
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
+
+
+# ── SGCN helpers ─────────────────────────────────────────────────────────────
+
+# Fraction of n_sample used as BFS seed nodes (1/20 = 5%)
+_SGCN_SEED_RATIO = 20
+# Hard upper bound on BFS hops for random_walk sampling
+_SGCN_RANDOM_WALK_MAX_HOPS = 10
+# Minimum training nodes to inject when a sampled subgraph contains none
+_SGCN_MIN_TRAIN_NODES = 32
+# Number of validation nodes sampled for the per-subgraph quality score
+_SGCN_VAL_SAMPLE_SIZE = 512
+
+def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample):
+    """Return a 1-D sorted LongTensor of sampled node indices.
+
+    Supported methods
+    -----------------
+    random_node  – uniformly sample *n_sample* nodes at random.
+    random_edge  – sample random edges and collect their incident nodes.
+    random_walk  – BFS expansion from random training-set seeds (no hop cap).
+    snowball     – BFS expansion capped at 2 hops from random seeds.
+    """
+    n_sample = min(n_sample, n_nodes)
+
+    if method == 'random_node':
+        perm = torch.randperm(n_nodes)[:n_sample]
+        return perm.sort().values
+
+    elif method == 'random_edge':
+        n_edges   = edge_index.shape[1]
+        edge_perm = torch.randperm(n_edges)[:min(n_sample * 2, n_edges)]
+        nodes     = edge_index[:, edge_perm].flatten().unique()
+        if len(nodes) < n_sample:
+            extra = torch.randperm(n_nodes)[:n_sample - len(nodes)]
+            nodes = torch.cat([nodes, extra]).unique()
+        return nodes[:n_sample].sort().values
+
+    elif method in ('random_walk', 'snowball'):
+        n_seeds  = min(max(n_sample // _SGCN_SEED_RATIO, 1), len(train_idx_cpu))
+        seed_perm = torch.randperm(len(train_idx_cpu))[:n_seeds]
+        seeds     = train_idx_cpu[seed_perm]
+
+        visited = torch.zeros(n_nodes, dtype=torch.bool)
+        visited[seeds] = True
+
+        row, col  = edge_index
+        max_hops  = 2 if method == 'snowball' else _SGCN_RANDOM_WALK_MAX_HOPS
+
+        for _ in range(max_hops):
+            if int(visited.sum()) >= n_sample:
+                break
+            mask      = visited[row]
+            new_nodes = col[mask]
+            visited[new_nodes] = True
+
+        visited_nodes = visited.nonzero(as_tuple=False).squeeze(1)
+
+        if len(visited_nodes) > n_sample:
+            perm = torch.randperm(len(visited_nodes))[:n_sample]
+            return visited_nodes[perm].sort().values
+        elif len(visited_nodes) < n_sample:
+            unvisited   = (~visited).nonzero(as_tuple=False).squeeze(1)
+            extra_perm  = torch.randperm(len(unvisited))[:n_sample - len(visited_nodes)]
+            return torch.cat([visited_nodes, unvisited[extra_perm]]).sort().values
+
+        return visited_nodes.sort().values
+
+    else:
+        raise ValueError(
+            f"Unknown subsampling_method: {method!r}. "
+            f"Choose from: 'random_node', 'random_edge', 'random_walk', 'snowball'."
+        )
+
+
+def train_epoch_sgcn(model, data, criterion, optimizer, device,
+                     train_idx, val_idx,
+                     n_subgraphs=5,
+                     subsampling_method='random_node',
+                     subgraph_ratio=0.5,
+                     truncation_ratio=0.2,
+                     use_labels=False, n_classes=112):
+    """SGCN training epoch with subgraph sampling and performance-aware aggregation.
+
+    Algorithm
+    ---------
+    For each of *n_subgraphs* independent subgraphs:
+
+    1. Sample a subgraph of size ``subgraph_ratio * n_nodes`` using the chosen
+       *subsampling_method*.
+    2. Reset the model to the epoch-start parameters and run one gradient step
+       on the subgraph's training nodes.
+    3. Evaluate the resulting local model on a mini-batch of validation nodes
+       (via a forward pass over the subgraph augmented with those val nodes).
+    4. Record the local state dict and validation loss (as quality score).
+
+    After all subgraphs are processed:
+
+    * Discard the bottom *truncation_ratio* fraction by validation score
+      (truncation mechanism – suppresses noise-dominated subgraphs).
+    * Aggregate the remaining local states with **softmax-weighted averaging**
+      (performance-aware aggregation).
+    * Load the aggregated state into the model and clear stale optimizer
+      momentum.
+
+    Parameters
+    ----------
+    n_subgraphs        : int   – number of independent subgraphs per epoch.
+    subsampling_method : str   – one of 'random_node', 'random_edge',
+                                  'random_walk', 'snowball'.
+    subgraph_ratio     : float – fraction of graph nodes in each subgraph.
+    truncation_ratio   : float – fraction of worst-performing subgraphs
+                                  to discard before aggregation.
+    """
+    model.train()
+
+    train_idx_cpu = train_idx.cpu()
+    val_idx_cpu   = val_idx.cpu()
+    n_nodes       = data.num_nodes
+    n_sample      = max(1, int(n_nodes * subgraph_ratio))
+    edge_index_cpu = data.edge_index.cpu()
+    train_idx_set  = set(train_idx_cpu.tolist())
+
+    # Snapshot of model parameters at the start of this epoch.  Every local
+    # subgraph model is initialised from this state so that aggregation is
+    # well-defined.
+    epoch_init_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+
+    local_states  = []
+    val_scores    = []
+    loss_sum      = 0.0
+    valid_batches = 0
+
+    val_sample_size = min(_SGCN_VAL_SAMPLE_SIZE, len(val_idx_cpu))
+
+    _cuda_sync(device)
+    epoch_start   = time.time()
+    sampling_time = 0.0
+
+    for _sg in range(n_subgraphs):
+        # ── 1. Sample subgraph node indices ─────────────────────────────────
+        t_sample  = time.time()
+        node_idx  = _sample_subgraph_nodes(
+            edge_index_cpu, n_nodes, train_idx_cpu, subsampling_method, n_sample
+        )
+
+        # Guarantee at least a few training nodes are included.
+        if not torch.isin(node_idx, train_idx_cpu).any():
+            extra    = train_idx_cpu[
+                torch.randperm(len(train_idx_cpu))[:min(_SGCN_MIN_TRAIN_NODES, len(train_idx_cpu))]
+            ]
+            node_idx = torch.cat([node_idx, extra]).unique()
+            node_idx = node_idx.sort().values
+
+        # ── 2. Extract induced subgraph ──────────────────────────────────────
+        edge_index_sub, edge_attr_sub = pyg_subgraph(
+            node_idx,
+            data.edge_index,
+            data.edge_attr,
+            relabel_nodes=True,
+            num_nodes=n_nodes,
+        )
+        sampling_time += time.time() - t_sample
+
+        x_sub  = data.x[node_idx].to(device)
+        y_sub  = data.y[node_idx].to(device)
+        ei_sub = edge_index_sub.to(device)
+        ea_sub = edge_attr_sub.to(device) if edge_attr_sub is not None else None
+
+        train_mask = torch.isin(node_idx, train_idx_cpu)
+        if not train_mask.any():
+            continue
+
+        if use_labels:
+            non_train_local = torch.where(~train_mask)[0]
+            x_sub = add_labels(
+                x_sub, data.train_labels_onehot, non_train_local, n_classes, device
+            )
+
+        # ── 3. Reset to epoch-start state, do one gradient step ─────────────
+        model.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
+        model.train()
+
+        train_mask_dev = train_mask.to(device)
+        pred = model(x_sub, ei_sub, ea_sub)
+        loss = criterion(pred[train_mask_dev], y_sub[train_mask_dev].float())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        loss_sum      += loss.item()
+        valid_batches += 1
+
+        # ── 4. Quick validation score ────────────────────────────────────────
+        model.eval()
+        with torch.no_grad():
+            val_sample  = val_idx_cpu[
+                torch.randperm(len(val_idx_cpu))[:val_sample_size]
+            ]
+            # Augment subgraph with val nodes so GCN can aggregate their
+            # neighborhood context without leaking their labels.
+            eval_node_idx = torch.cat([node_idx, val_sample]).unique()
+            eval_node_idx = eval_node_idx.sort().values
+
+            ei_eval, ea_eval = pyg_subgraph(
+                eval_node_idx,
+                data.edge_index,
+                data.edge_attr,
+                relabel_nodes=True,
+                num_nodes=n_nodes,
+            )
+
+            x_eval  = data.x[eval_node_idx].to(device)
+            y_eval  = data.y[eval_node_idx].to(device)
+            ei_eval = ei_eval.to(device)
+            ea_eval = ea_eval.to(device) if ea_eval is not None else None
+
+            if use_labels:
+                eval_train_mask = torch.isin(eval_node_idx, train_idx_cpu)
+                non_train_eval  = torch.where(~eval_train_mask)[0]
+                x_eval = add_labels(
+                    x_eval, data.train_labels_onehot,
+                    non_train_eval, n_classes, device
+                )
+
+            pred_eval     = model(x_eval, ei_eval, ea_eval)
+            val_local_mask = torch.isin(eval_node_idx, val_sample).to(device)
+            val_loss = criterion(
+                pred_eval[val_local_mask], y_eval[val_local_mask].float()
+            )
+            val_score = -val_loss.item()   # higher is better
+
+        local_states.append({k: v.clone().cpu() for k, v in model.state_dict().items()})
+        val_scores.append(val_score)
+
+    # ── Fallback if no valid subgraph was processed ──────────────────────────
+    if not local_states:
+        model.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
+        _cuda_sync(device)
+        return 0.0, time.time() - epoch_start, sampling_time
+
+    # ── 5. Truncation: keep top (1 − truncation_ratio) subgraphs ────────────
+    n_keep     = max(1, int(len(local_states) * (1.0 - truncation_ratio)))
+    sorted_idx = sorted(range(len(val_scores)), key=lambda i: val_scores[i],
+                        reverse=True)
+    kept_idx   = sorted_idx[:n_keep]
+
+    # ── 6. Performance-aware weighted aggregation (softmax over val scores) ──
+    kept_scores = torch.tensor([val_scores[i] for i in kept_idx], dtype=torch.float)
+    weights     = torch.softmax(kept_scores, dim=0)
+
+    agg_state = {}
+    for key in epoch_init_state:
+        stacked = torch.stack(
+            [local_states[i][key].float() for i in kept_idx], dim=0
+        )
+        w           = weights.view([-1] + [1] * (stacked.dim() - 1))
+        agg_state[key] = (stacked * w).sum(dim=0).to(epoch_init_state[key].dtype)
+
+    # ── 7. Load aggregated state; clear stale optimiser momentum ────────────
+    model.load_state_dict({k: v.to(device) for k, v in agg_state.items()})
+    optimizer.state.clear()
+
+    _cuda_sync(device)
+    epoch_time = time.time() - epoch_start
+    avg_loss   = loss_sum / valid_batches if valid_batches > 0 else 0.0
+    return avg_loss, epoch_time, sampling_time
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device,
@@ -160,7 +430,9 @@ def evaluate(model, dataloader, labels, train_idx, val_idx, test_idx,
 def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         gen_model_fn, device, n_layers, lr, weight_decay, n_epochs,
         eval_every, log_every, save_pred, use_labels=False, n_classes=112,
-        mpnn='gcn'):
+        mpnn='gcn',
+        subsampling_method='random_node',
+        truncation_ratio=0.2):
     evaluator_wrapper = lambda pred, lbls: evaluator.eval(
         {'y_pred': pred, 'y_true': lbls}
     )['rocauc']
@@ -179,6 +451,10 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             num_steps=saint_num_steps,
             num_workers=4,
         )
+    elif mpnn == 'sgcn':
+        # SGCN handles its own subgraph sampling inside train_epoch_sgcn;
+        # no external DataLoader is required.
+        train_loader = None
     else:
         train_loader = NeighborLoader(
             data,
@@ -218,6 +494,14 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             loss, epoch_time, sampling_time = train_epoch_saint(
                 model, train_loader, criterion, optimizer, device,
                 train_idx, use_labels, n_classes
+            )
+        elif mpnn == 'sgcn':
+            loss, epoch_time, sampling_time = train_epoch_sgcn(
+                model, data, criterion, optimizer, device,
+                train_idx, val_idx,
+                subsampling_method=subsampling_method,
+                truncation_ratio=truncation_ratio,
+                use_labels=use_labels, n_classes=n_classes,
             )
         else:
             loss, epoch_time, sampling_time = train_epoch(
