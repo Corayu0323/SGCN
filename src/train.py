@@ -97,8 +97,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                      subsampling_method='random_node',
                      subgraph_ratio=0.5,
                      truncation_ratio=0.2,
+                     aggregation_method='sgcn',
                      use_labels=False, n_classes=112):
-    """SGCN training epoch with subgraph sampling and performance-aware aggregation.
+    """SGCN training epoch with subgraph sampling and configurable aggregation.
 
     Algorithm
     ---------
@@ -116,8 +117,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
     * Discard the bottom *truncation_ratio* fraction by validation score
       (truncation mechanism – suppresses noise-dominated subgraphs).
-    * Aggregate the remaining local states with **softmax-weighted averaging**
-      (performance-aware aggregation).
+    * Aggregate the remaining local states according to *aggregation_method*.
     * Load the aggregated state into the model and clear stale optimizer
       momentum.
 
@@ -129,6 +129,14 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     subgraph_ratio     : float – fraction of graph nodes in each subgraph.
     truncation_ratio   : float – fraction of worst-performing subgraphs
                                   to discard before aggregation.
+    aggregation_method : str   – aggregation strategy after truncation:
+                                  'sgcn'     – softmax-weighted average over
+                                               validation scores (default).
+                                  'avg'      – uniform equal-weight average
+                                               (SGCN-Avg).
+                                  'weighted' – performance-based linear-
+                                               normalized weighted average
+                                               (SGCN-Weighted).
     """
     model.train()
 
@@ -264,9 +272,26 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                         reverse=True)
     kept_idx   = sorted_idx[:n_keep]
 
-    # ── 6. Performance-aware weighted aggregation (softmax over val scores) ──
+    # ── 6. Aggregate local states according to aggregation_method ───────────
     kept_scores = torch.tensor([val_scores[i] for i in kept_idx], dtype=torch.float)
-    weights     = torch.softmax(kept_scores, dim=0)
+
+    if aggregation_method == 'avg':
+        # SGCN-Avg: uniform equal-weight average
+        weights = torch.ones(len(kept_idx), dtype=torch.float) / len(kept_idx)
+    elif aggregation_method == 'weighted':
+        # SGCN-Weighted: performance-based linear normalization.
+        # Shift scores so the minimum becomes a small positive value, then
+        # normalize so weights sum to 1.
+        shifted = kept_scores - kept_scores.min() + 1e-8
+        weights = shifted / shifted.sum()
+    else:
+        # Default 'sgcn': softmax-weighted average over validation scores
+        if aggregation_method != 'sgcn':
+            raise ValueError(
+                f"Unknown aggregation_method: {aggregation_method!r}. "
+                f"Choose from: 'sgcn', 'avg', 'weighted'."
+            )
+        weights = torch.softmax(kept_scores, dim=0)
 
     agg_state = {}
     for key in epoch_init_state:
@@ -432,7 +457,8 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         eval_every, log_every, save_pred, use_labels=False, n_classes=112,
         mpnn='gcn',
         subsampling_method='random_node',
-        truncation_ratio=0.2):
+        truncation_ratio=0.2,
+        aggregation_method='sgcn'):
     evaluator_wrapper = lambda pred, lbls: evaluator.eval(
         {'y_pred': pred, 'y_true': lbls}
     )['rocauc']
@@ -501,6 +527,7 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 train_idx, val_idx,
                 subsampling_method=subsampling_method,
                 truncation_ratio=truncation_ratio,
+                aggregation_method=aggregation_method,
                 use_labels=use_labels, n_classes=n_classes,
             )
         else:
