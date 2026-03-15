@@ -1,7 +1,11 @@
 import os
+import subprocess
+import sys
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import yaml
 
 
 def setup_dirs(results_dir='results'):
@@ -11,6 +15,101 @@ def setup_dirs(results_dir='results'):
     os.makedirs(csv_dir,     exist_ok=True)
     os.makedirs(figures_dir, exist_ok=True)
     return csv_dir, figures_dir
+
+
+def setup_experiment_dir(results_dir='results', timestamp=None):
+    """Create a unique experiment folder and a figures subfolder inside it.
+
+    Returns
+    -------
+    exp_dir     : str – path to the new experiment folder.
+    figures_dir : str – path to the figures subfolder inside exp_dir.
+    """
+    if timestamp is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    exp_dir     = os.path.join(results_dir, f'exp_{timestamp}')
+    figures_dir = os.path.join(exp_dir, 'figures')
+    os.makedirs(exp_dir,     exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+    return exp_dir, figures_dir
+
+
+def _get_git_commit():
+    """Return the current HEAD commit SHA, or 'N/A' if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else 'N/A'
+    except Exception as exc:
+        print(f'[logging_utils] Could not retrieve git commit: {exc}')
+        return 'N/A'
+
+
+def save_config(config, exp_dir, device=None):
+    """Save experiment configuration and reproducibility metadata to config.yaml.
+
+    Parameters
+    ----------
+    config  : dict – hyperparameters and settings for the experiment.
+    exp_dir : str  – path to the experiment folder.
+    device  : optional torch.device or str – device used for training.
+    """
+    import torch
+
+    meta = {
+        'timestamp':      datetime.now().strftime('%Y%m%d_%H%M%S'),
+        'git_commit':     _get_git_commit(),
+        'python_version': sys.version,
+        'torch_version':  torch.__version__,
+        'device':         str(device) if device is not None else 'N/A',
+    }
+    full_config = {'config': config, 'meta': meta}
+    path = os.path.join(exp_dir, 'config.yaml')
+    with open(path, 'w') as f:
+        yaml.dump(full_config, f, default_flow_style=False, sort_keys=False)
+    print(f'Saved: {path}')
+    return full_config
+
+
+def update_experiment_index(exp_dir, config, agg_stats, results_dir='results'):
+    """Append one row to results/experiment_index.csv for this experiment.
+
+    Parameters
+    ----------
+    exp_dir     : str  – path to the experiment folder (used as exp_id).
+    config      : dict – hyperparameters (must contain method, dataset, etc.).
+    agg_stats   : dict – aggregated statistics dict (from compute_aggregate).
+    results_dir : str  – root results directory.
+    """
+    exp_id    = os.path.basename(exp_dir)
+    timestamp = exp_id.replace('exp_', '', 1)
+
+    row = {
+        'exp_id':             exp_id,
+        'timestamp':          timestamp,
+        'method':             config.get('method', 'N/A'),
+        'dataset':            config.get('dataset', 'N/A'),
+        'sampling_method':    config.get('sampling_method', 'N/A'),
+        'trunc_ratio':        config.get('trunc_ratio', float('nan')),
+        'mean_best_test_auc': agg_stats.get('mean_best_test_auc', float('nan')),
+        'std_best_test_auc':  agg_stats.get('std_best_test_auc', float('nan')),
+        'n_runs':             agg_stats.get('n_runs', 0),
+    }
+
+    index_path = os.path.join(results_dir, 'experiment_index.csv')
+    new_row_df = pd.DataFrame([row])
+
+    if os.path.exists(index_path):
+        existing = pd.read_csv(index_path)
+        updated  = pd.concat([existing, new_row_df], ignore_index=True)
+    else:
+        updated = new_row_df
+
+    updated.to_csv(index_path, index=False)
+    print(f'Updated: {index_path}')
+    return updated
 
 
 def build_epoch_df(method, run_id, seed, epoch_records):
