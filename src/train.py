@@ -29,7 +29,8 @@ _SGCN_MIN_TRAIN_NODES = 32
 # Number of validation nodes sampled for the per-subgraph quality score
 _SGCN_VAL_SAMPLE_SIZE = 512
 
-def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample):
+def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
+                           subgraph_max_nodes=None):
     """Return a 1-D sorted LongTensor of sampled node indices.
 
     Supported methods
@@ -38,7 +39,16 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample)
     random_edge  – sample random edges and collect their incident nodes.
     random_walk  – BFS expansion from random training-set seeds (no hop cap).
     snowball     – BFS expansion capped at 2 hops from random seeds.
+
+    Parameters
+    ----------
+    subgraph_max_nodes : int or None
+        When provided, overrides *n_sample* as the hard upper bound on the
+        number of returned nodes.  Has priority over the ratio-based value.
     """
+    # subgraph_max_nodes takes priority over the ratio-derived n_sample.
+    if subgraph_max_nodes is not None and subgraph_max_nodes > 0:
+        n_sample = subgraph_max_nodes
     n_sample = min(n_sample, n_nodes)
 
     if method == 'random_node':
@@ -95,23 +105,29 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                      train_idx, val_idx,
                      n_subgraphs=5,
                      subsampling_method='random_node',
+                     subgraph_max_nodes=256,
+                     max_subgraph_edges=300000,
                      subgraph_ratio=0.5,
                      truncation_ratio=0.2,
                      aggregation_method='sgcn',
-                     use_labels=False, n_classes=112):
+                     use_labels=False, n_classes=112,
+                     debug_subgraph_stats=False):
     """SGCN training epoch with subgraph sampling and configurable aggregation.
 
     Algorithm
     ---------
     For each of *n_subgraphs* independent subgraphs:
 
-    1. Sample a subgraph of size ``subgraph_ratio * n_nodes`` using the chosen
-       *subsampling_method*.
-    2. Reset the model to the epoch-start parameters and run one gradient step
+    1. Sample a subgraph of at most *subgraph_max_nodes* nodes using the
+       chosen *subsampling_method*.  *subgraph_ratio* is used as a fallback
+       when *subgraph_max_nodes* is not set (i.e. <= 0).
+    2. Enforce a hard edge-count limit of *max_subgraph_edges* by randomly
+       dropping edges when the induced subgraph exceeds that threshold.
+    3. Reset the model to the epoch-start parameters and run one gradient step
        on the subgraph's training nodes.
-    3. Evaluate the resulting local model on a mini-batch of validation nodes
+    4. Evaluate the resulting local model on a mini-batch of validation nodes
        (via a forward pass over the subgraph augmented with those val nodes).
-    4. Record the local state dict and validation loss (as quality score).
+    5. Record the local state dict and validation loss (as quality score).
 
     After all subgraphs are processed:
 
@@ -123,27 +139,41 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
     Parameters
     ----------
-    n_subgraphs        : int   – number of independent subgraphs per epoch.
-    subsampling_method : str   – one of 'random_node', 'random_edge',
-                                  'random_walk', 'snowball'.
-    subgraph_ratio     : float – fraction of graph nodes in each subgraph.
-    truncation_ratio   : float – fraction of worst-performing subgraphs
-                                  to discard before aggregation.
-    aggregation_method : str   – aggregation strategy after truncation:
-                                  'sgcn'     – softmax-weighted average over
-                                               validation scores (default).
-                                  'avg'      – uniform equal-weight average
-                                               (SGCN-Avg).
-                                  'weighted' – performance-based linear-
-                                               normalized weighted average
-                                               (SGCN-Weighted).
+    n_subgraphs         : int   – number of independent subgraphs per epoch.
+    subsampling_method  : str   – one of 'random_node', 'random_edge',
+                                   'random_walk', 'snowball'.
+    subgraph_max_nodes  : int   – hard upper bound on nodes per subgraph.
+                                   Takes priority over *subgraph_ratio*.
+                                   Set <= 0 to fall back to *subgraph_ratio*.
+    max_subgraph_edges  : int   – hard upper bound on edges per subgraph.
+                                   Excess edges are randomly dropped (with
+                                   matching edge_attr rows when present).
+                                   Set <= 0 to disable.
+    subgraph_ratio      : float – fraction of graph nodes per subgraph; used
+                                   only when *subgraph_max_nodes* <= 0.
+    truncation_ratio    : float – fraction of worst-performing subgraphs
+                                   to discard before aggregation.
+    aggregation_method  : str   – aggregation strategy after truncation:
+                                   'sgcn'     – softmax-weighted average over
+                                                validation scores (default).
+                                   'avg'      – uniform equal-weight average
+                                                (SGCN-Avg).
+                                   'weighted' – performance-based linear-
+                                                normalized weighted average
+                                                (SGCN-Weighted).
+    debug_subgraph_stats : bool – when True, print per-subgraph shape and
+                                   CUDA memory stats before each forward pass.
     """
     model.train()
 
     train_idx_cpu = train_idx.cpu()
     val_idx_cpu   = val_idx.cpu()
     n_nodes       = data.num_nodes
-    n_sample      = max(1, int(n_nodes * subgraph_ratio))
+    # subgraph_max_nodes takes priority; fall back to ratio-based size.
+    if subgraph_max_nodes is not None and subgraph_max_nodes > 0:
+        n_sample = subgraph_max_nodes
+    else:
+        n_sample = max(1, int(n_nodes * subgraph_ratio))
     edge_index_cpu = data.edge_index.cpu()
     train_idx_set  = set(train_idx_cpu.tolist())
 
@@ -167,7 +197,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         # ── 1. Sample subgraph node indices ─────────────────────────────────
         t_sample  = time.time()
         node_idx  = _sample_subgraph_nodes(
-            edge_index_cpu, n_nodes, train_idx_cpu, subsampling_method, n_sample
+            edge_index_cpu, n_nodes, train_idx_cpu, subsampling_method, n_sample,
+            subgraph_max_nodes=subgraph_max_nodes,
         )
 
         # Guarantee at least a few training nodes are included.
@@ -186,6 +217,16 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
             relabel_nodes=True,
             num_nodes=n_nodes,
         )
+
+        # ── 2a. Enforce hard edge-count cap ─────────────────────────────────
+        if max_subgraph_edges is not None and max_subgraph_edges > 0:
+            n_edges_sub = edge_index_sub.size(1)
+            if n_edges_sub > max_subgraph_edges:
+                perm          = torch.randperm(n_edges_sub)[:max_subgraph_edges]
+                edge_index_sub = edge_index_sub[:, perm]
+                if edge_attr_sub is not None:
+                    edge_attr_sub = edge_attr_sub[perm]
+
         sampling_time += time.time() - t_sample
 
         x_sub  = data.x[node_idx].to(device)
@@ -195,12 +236,29 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
         train_mask = torch.isin(node_idx, train_idx_cpu)
         if not train_mask.any():
+            del x_sub, y_sub, ei_sub, ea_sub
             continue
 
         if use_labels:
             non_train_local = torch.where(~train_mask)[0]
             x_sub = add_labels(
                 x_sub, data.train_labels_onehot, non_train_local, n_classes, device
+            )
+
+        # ── Debug: print subgraph stats before forward pass ─────────────────
+        if debug_subgraph_stats:
+            print(
+                f'[SGCN debug] subgraph {_sg}: '
+                f'num_sub_nodes={x_sub.shape[0]}, '
+                f'num_sub_edges={ei_sub.shape[1]}, '
+                f'x_sub.shape={tuple(x_sub.shape)}, '
+                f'ei_sub.shape={tuple(ei_sub.shape)}'
+                + (f', ea_sub.shape={tuple(ea_sub.shape)}' if ea_sub is not None else '')
+                + (
+                    f', cuda_allocated={torch.cuda.memory_allocated(device)}, '
+                    f'cuda_reserved={torch.cuda.memory_reserved(device)}'
+                    if device.type == 'cuda' else ''
+                )
             )
 
         # ── 3. Reset to epoch-start state, do one gradient step ─────────────
@@ -217,6 +275,11 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
         loss_sum      += loss.item()
         valid_batches += 1
+
+        # Free training-step tensors before the validation forward pass.
+        del pred, loss, train_mask_dev
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         # ── 4. Quick validation score ────────────────────────────────────────
         model.eval()
@@ -236,6 +299,15 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                 relabel_nodes=True,
                 num_nodes=n_nodes,
             )
+
+            # Apply the same edge cap to the eval subgraph.
+            if max_subgraph_edges is not None and max_subgraph_edges > 0:
+                n_edges_eval = ei_eval.size(1)
+                if n_edges_eval > max_subgraph_edges:
+                    perm_eval = torch.randperm(n_edges_eval)[:max_subgraph_edges]
+                    ei_eval   = ei_eval[:, perm_eval]
+                    if ea_eval is not None:
+                        ea_eval = ea_eval[perm_eval]
 
             x_eval  = data.x[eval_node_idx].to(device)
             y_eval  = data.y[eval_node_idx].to(device)
@@ -257,8 +329,17 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
             )
             val_score = -val_loss.item()   # higher is better
 
+            del pred_eval, val_loss, val_local_mask
+            del x_eval, y_eval, ei_eval, ea_eval
+
+        # Save local state dict on CPU to avoid multi-copy GPU residency.
         local_states.append({k: v.clone().cpu() for k, v in model.state_dict().items()})
         val_scores.append(val_score)
+
+        # Release per-subgraph GPU tensors.
+        del x_sub, y_sub, ei_sub, ea_sub, train_mask
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
     # ── Fallback if no valid subgraph was processed ──────────────────────────
     if not local_states:
@@ -458,7 +539,11 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         mpnn='gcn',
         subsampling_method='random_node',
         truncation_ratio=0.2,
-        aggregation_method='sgcn'):
+        aggregation_method='sgcn',
+        n_subgraphs=5,
+        subgraph_max_nodes=256,
+        max_subgraph_edges=300000,
+        debug_subgraph_stats=False):
     evaluator_wrapper = lambda pred, lbls: evaluator.eval(
         {'y_pred': pred, 'y_true': lbls}
     )['rocauc']
@@ -525,10 +610,14 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             loss, epoch_time, sampling_time = train_epoch_sgcn(
                 model, data, criterion, optimizer, device,
                 train_idx, val_idx,
+                n_subgraphs=n_subgraphs,
                 subsampling_method=subsampling_method,
+                subgraph_max_nodes=subgraph_max_nodes,
+                max_subgraph_edges=max_subgraph_edges,
                 truncation_ratio=truncation_ratio,
                 aggregation_method=aggregation_method,
                 use_labels=use_labels, n_classes=n_classes,
+                debug_subgraph_stats=debug_subgraph_stats,
             )
         else:
             loss, epoch_time, sampling_time = train_epoch(
