@@ -438,13 +438,13 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
                       train_idx, use_labels=False, n_classes=112):
     """Training epoch using GraphSAINT subgraph-sampling batches.
 
-    Unlike NeighborLoader batches (which separate seed nodes from context
-    neighbors), GraphSAINT batches are induced subgraphs where every node
-    may be a training node.  We identify the training nodes within each
-    subgraph via ``batch.n_id`` and compute the loss only over them.
+    GraphSAINT batches are induced subgraphs where every node may be a
+    training node.  Training nodes are identified via ``batch.train_mask``.
+    When the batch carries ``batch.node_norm`` (sampling normalisation
+    weights produced by the GraphSAINT sampler), each per-node loss term is
+    scaled by the corresponding weight before summing.
     """
     model.train()
-    train_idx_device = train_idx.to(device)
     loss_sum, total = 0, 0
     sampling_time   = 0.0
 
@@ -459,15 +459,7 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
 
         batch = batch.to(device)
 
-        # Identify which nodes in this subgraph belong to the training set.
-        # GraphSAINT batches expose train_mask directly; fall back to n_id for
-        # NeighborLoader-style batches that carry global node indices.
-        if hasattr(batch, 'train_mask'):
-            train_mask = batch.train_mask
-        elif hasattr(batch, 'n_id'):
-            train_mask = torch.isin(batch.n_id, train_idx_device)
-        else:
-            raise AttributeError("Batch has neither 'train_mask' nor 'n_id'")
+        train_mask = batch.train_mask
         if train_mask.sum() == 0:
             continue
 
@@ -481,14 +473,28 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
             x = batch.x
 
         pred = model(x, batch.edge_index, batch.edge_attr)
-        loss = criterion(pred[train_mask], batch.y[train_mask].float())
+
+        # Apply GraphSAINT sampling normalisation weights when available.
+        if hasattr(batch, 'node_norm'):
+            loss_per_node = F.binary_cross_entropy_with_logits(
+                pred[train_mask], batch.y[train_mask].float(), reduction='none'
+            )
+            loss = (loss_per_node * batch.node_norm[train_mask]).sum()
+        else:
+            loss = criterion(pred[train_mask], batch.y[train_mask].float())
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         n_train_in_batch = train_mask.sum().item()
-        loss_sum += loss.item() * n_train_in_batch
+        # node_norm path: loss is already a weighted sum; add directly.
+        # fallback path: criterion returns a mean; scale back to a sum for
+        # consistent per-node averaging across the epoch.
+        if hasattr(batch, 'node_norm'):
+            loss_sum += loss.item()
+        else:
+            loss_sum += loss.item() * n_train_in_batch
         total    += n_train_in_batch
 
     _cuda_sync(device)
