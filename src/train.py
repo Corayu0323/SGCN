@@ -460,7 +460,14 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
         batch = batch.to(device)
 
         # Identify which nodes in this subgraph belong to the training set.
-        train_mask = torch.isin(batch.n_id, train_idx_device)
+        # GraphSAINT batches expose train_mask directly; fall back to n_id for
+        # NeighborLoader-style batches that carry global node indices.
+        if hasattr(batch, 'train_mask'):
+            train_mask = batch.train_mask
+        elif hasattr(batch, 'n_id'):
+            train_mask = torch.isin(batch.n_id, train_idx_device)
+        else:
+            raise AttributeError("Batch has neither 'train_mask' nor 'n_id'")
         if train_mask.sum() == 0:
             continue
 
@@ -551,6 +558,14 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     train_batch_size = (len(train_idx) + 9) // 10
 
     if mpnn == 'graphsaint':
+        # Attach boolean split masks to data so GraphSAINT batches inherit them.
+        data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        data.train_mask[train_idx] = True
+        data.val_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        data.val_mask[val_idx] = True
+        data.test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        data.test_mask[test_idx] = True
+
         # GraphSAINT: sample random-walk-induced subgraphs instead of
         # per-node neighborhoods.  num_steps mirrors the ~10 batches/epoch
         # produced by NeighborLoader, and walk_length provides a 2-hop reach.
