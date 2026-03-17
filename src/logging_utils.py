@@ -93,6 +93,7 @@ def update_experiment_index(exp_dir, config, agg_stats, results_dir='results'):
         'dataset':            config.get('dataset', 'N/A'),
         'sampling_method':    config.get('sampling_method', 'N/A'),
         'trunc_ratio':        config.get('trunc_ratio', float('nan')),
+        'local_epochs':       config.get('local_epochs', float('nan')),
         'mean_best_test_auc': agg_stats.get('mean_best_test_auc', float('nan')),
         'std_best_test_auc':  agg_stats.get('std_best_test_auc', float('nan')),
         'n_runs':             agg_stats.get('n_runs', 0),
@@ -129,7 +130,7 @@ def build_run_record(method, run_id, seed, result):
     epoch_times    = [r['train_epoch_time']    for r in epoch_records]
     sampling_times = [r['train_sampling_time'] for r in epoch_records]
 
-    return {
+    record = {
         'method':                  method,
         'run_id':                  run_id,
         'seed':                    seed,
@@ -142,6 +143,21 @@ def build_run_record(method, run_id, seed, result):
         'mean_eval_time':          np.mean(eval_times) if eval_times else float('nan'),
         'total_run_time':          result['total_run_time'],
     }
+
+    # For SGCN, include parallel-pipeline timing summary fields.
+    if method == 'sgcn' and epoch_records and 'sgcn_epoch_time_max' in epoch_records[0]:
+        sgcn_epoch_times = [r['sgcn_epoch_time_max']        for r in epoch_records]
+        max_sg_times     = [r['max_subgraph_pipeline_time'] for r in epoch_records]
+        agg_times        = [r['aggregation_time']           for r in epoch_records]
+        local_epochs_val = epoch_records[0].get('local_epochs', float('nan'))
+        record.update({
+            'local_epochs':                  local_epochs_val,
+            'mean_sgcn_epoch_time_max':      np.mean(sgcn_epoch_times),
+            'mean_max_subgraph_pipeline_time': np.mean(max_sg_times),
+            'mean_aggregation_time':         np.mean(agg_times),
+        })
+
+    return record
 
 
 def save_epoch_metrics(epoch_dfs, csv_dir):
@@ -167,7 +183,7 @@ def compute_aggregate(run_records):
     df     = pd.DataFrame(run_records)
     method = df['method'].iloc[0] if len(df) > 0 else 'unknown'
     n_runs = len(df)
-    return {
+    agg = {
         'method':                 method,
         'n_runs':                 n_runs,
         'mean_best_val_auc':      df['best_val_auc'].mean(),
@@ -181,6 +197,18 @@ def compute_aggregate(run_records):
         'mean_total_run_time':    df['total_run_time'].mean(),
         'std_total_run_time':     df['total_run_time'].std(ddof=1),
     }
+    # For SGCN runs include parallel-pipeline timing aggregates.
+    if 'mean_sgcn_epoch_time_max' in df.columns:
+        agg.update({
+            'local_epochs':                       df['local_epochs'].iloc[0],
+            'mean_sgcn_epoch_time_max':           df['mean_sgcn_epoch_time_max'].mean(),
+            'std_sgcn_epoch_time_max':            df['mean_sgcn_epoch_time_max'].std(ddof=1),
+            'mean_max_subgraph_pipeline_time':    df['mean_max_subgraph_pipeline_time'].mean(),
+            'std_max_subgraph_pipeline_time':     df['mean_max_subgraph_pipeline_time'].std(ddof=1),
+            'mean_aggregation_time':              df['mean_aggregation_time'].mean(),
+            'std_aggregation_time':               df['mean_aggregation_time'].std(ddof=1),
+        })
+    return agg
 
 
 def save_aggregate_summary(run_records, csv_dir):

@@ -104,6 +104,7 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
 def train_epoch_sgcn(model, data, criterion, optimizer, device,
                      train_idx, val_idx,
                      n_subgraphs=5,
+                     local_epochs=5,
                      subsampling_method='random_node',
                      subgraph_max_nodes=256,
                      max_subgraph_edges=300000,
@@ -112,7 +113,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                      aggregation_method='sgcn',
                      use_labels=False, n_classes=112,
                      debug_subgraph_stats=False):
-    """SGCN training epoch with subgraph sampling and configurable aggregation.
+    """SGCN training epoch with subgraph sampling, local multi-epoch training,
+    and configurable aggregation.
 
     Algorithm
     ---------
@@ -123,11 +125,14 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
        when *subgraph_max_nodes* is not set (i.e. <= 0).
     2. Enforce a hard edge-count limit of *max_subgraph_edges* by randomly
        dropping edges when the induced subgraph exceeds that threshold.
-    3. Reset the model to the epoch-start parameters and run one gradient step
-       on the subgraph's training nodes.
-    4. Evaluate the resulting local model on a mini-batch of validation nodes
+    3. Reset the model to the epoch-start parameters (every subgraph starts
+       from the same *epoch_init_state* – subgraphs are fully independent).
+       Clear optimizer momentum so subgraphs do not share gradient state.
+    4. Run *local_epochs* gradient steps on the fixed subgraph data (no
+       re-sampling between local steps).
+    5. Evaluate the resulting local model on a mini-batch of validation nodes
        (via a forward pass over the subgraph augmented with those val nodes).
-    5. Record the local state dict and validation loss (as quality score).
+    6. Record the local state dict and validation loss (as quality score).
 
     After all subgraphs are processed:
 
@@ -137,9 +142,28 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     * Load the aggregated state into the model and clear stale optimizer
       momentum.
 
+    Timing
+    ------
+    This function records per-subgraph timings:
+      subgraph_sampling_time_r : time to sample and build the subgraph.
+      subgraph_train_time_r    : time to run *local_epochs* gradient steps.
+      subgraph_eval_time_r     : time for the validation scoring forward pass.
+      subgraph_total_time_r    = sampling + train + eval for subgraph r.
+
+    The returned epoch time uses the **parallel-pipeline** convention:
+      max_subgraph_pipeline_time = max_r(subgraph_total_time_r)
+      sgcn_epoch_time_max        = max_subgraph_pipeline_time + aggregation_time
+
+    This is NOT the serial sum of all subgraph times.  It models the
+    wall-clock time of a future parallel implementation where all subgraphs
+    run concurrently and the epoch completes when the slowest subgraph
+    finishes, plus the final aggregation step.
+
     Parameters
     ----------
     n_subgraphs         : int   – number of independent subgraphs per epoch.
+    local_epochs        : int   – number of local gradient steps per subgraph
+                                   (L in the paper).  Default: 5.
     subsampling_method  : str   – one of 'random_node', 'random_edge',
                                    'random_walk', 'snowball'.
     subgraph_max_nodes  : int   – hard upper bound on nodes per subgraph.
@@ -163,6 +187,17 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                                                 (SGCN-Weighted).
     debug_subgraph_stats : bool – when True, print per-subgraph shape and
                                    CUDA memory stats before each forward pass.
+
+    Returns
+    -------
+    avg_loss                 : float – average training loss over valid subgraphs.
+    sgcn_epoch_time_max      : float – parallel-pipeline epoch time (see above).
+    total_sampling_time      : float – sum of all subgraph sampling times
+                                        (kept for backward compatibility).
+    extra_sgcn               : dict  – detailed timing fields:
+        local_epochs, max_subgraph_pipeline_time, aggregation_time,
+        subgraph_sampling_times, subgraph_train_times,
+        subgraph_eval_times, subgraph_total_times.
     """
     model.train()
 
@@ -175,11 +210,10 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     else:
         n_sample = max(1, int(n_nodes * subgraph_ratio))
     edge_index_cpu = data.edge_index.cpu()
-    train_idx_set  = set(train_idx_cpu.tolist())
 
     # Snapshot of model parameters at the start of this epoch.  Every local
     # subgraph model is initialised from this state so that aggregation is
-    # well-defined.
+    # well-defined and subgraphs are fully independent of each other.
     epoch_init_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
 
     local_states  = []
@@ -189,13 +223,16 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
     val_sample_size = min(_SGCN_VAL_SAMPLE_SIZE, len(val_idx_cpu))
 
-    _cuda_sync(device)
-    epoch_start   = time.time()
-    sampling_time = 0.0
+    # Per-subgraph timing lists (index r corresponds to subgraph r).
+    subgraph_sampling_times = []
+    subgraph_train_times    = []
+    subgraph_eval_times     = []
 
     for _sg in range(n_subgraphs):
         # ── 1. Sample subgraph node indices ─────────────────────────────────
-        t_sample  = time.time()
+        _cuda_sync(device)
+        t_sample_start = time.time()
+
         node_idx  = _sample_subgraph_nodes(
             edge_index_cpu, n_nodes, train_idx_cpu, subsampling_method, n_sample,
             subgraph_max_nodes=subgraph_max_nodes,
@@ -227,7 +264,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                 if edge_attr_sub is not None:
                     edge_attr_sub = edge_attr_sub[perm]
 
-        sampling_time += time.time() - t_sample
+        _cuda_sync(device)
+        subgraph_sampling_times.append(time.time() - t_sample_start)
 
         x_sub  = data.x[node_idx].to(device)
         y_sub  = data.y[node_idx].to(device)
@@ -237,6 +275,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         train_mask = torch.isin(node_idx, train_idx_cpu)
         if not train_mask.any():
             del x_sub, y_sub, ei_sub, ea_sub
+            # Record zero train/eval times; sampling time is preserved.
+            subgraph_train_times.append(0.0)
+            subgraph_eval_times.append(0.0)
             continue
 
         if use_labels:
@@ -261,27 +302,48 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                 )
             )
 
-        # ── 3. Reset to epoch-start state, do one gradient step ─────────────
+        # ── 3. Reset to epoch-start state; clear optimizer momentum ─────────
+        # Each subgraph starts from the same epoch_init_state so that
+        # subgraphs are fully independent and their trained states are
+        # comparable for aggregation.  Clearing the optimizer state ensures
+        # accumulated momentum from previous subgraphs does not bleed through.
         model.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
+        optimizer.state.clear()
         model.train()
 
+        # ── 4. Train L local epochs on the fixed subgraph data ──────────────
+        # All local_epochs steps use the same subgraph – no re-sampling.
+        _cuda_sync(device)
+        t_train_start  = time.time()
         train_mask_dev = train_mask.to(device)
-        pred = model(x_sub, ei_sub, ea_sub)
-        loss = criterion(pred[train_mask_dev], y_sub[train_mask_dev].float())
+        last_loss      = 0.0
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        for _le in range(local_epochs):
+            pred = model(x_sub, ei_sub, ea_sub)
+            loss = criterion(pred[train_mask_dev], y_sub[train_mask_dev].float())
 
-        loss_sum      += loss.item()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            last_loss = loss.item()
+            del pred, loss
+
+        _cuda_sync(device)
+        subgraph_train_times.append(time.time() - t_train_start)
+
+        loss_sum      += last_loss
         valid_batches += 1
 
-        # Free training-step tensors before the validation forward pass.
-        del pred, loss, train_mask_dev
+        # Free training tensors before the validation forward pass.
+        del train_mask_dev
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
-        # ── 4. Quick validation score ────────────────────────────────────────
+        # ── 5. Quick validation score ────────────────────────────────────────
+        _cuda_sync(device)
+        t_eval_start = time.time()
+
         model.eval()
         with torch.no_grad():
             val_sample  = val_idx_cpu[
@@ -322,7 +384,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                     non_train_eval, n_classes, device
                 )
 
-            pred_eval     = model(x_eval, ei_eval, ea_eval)
+            pred_eval      = model(x_eval, ei_eval, ea_eval)
             val_local_mask = torch.isin(eval_node_idx, val_sample).to(device)
             val_loss = criterion(
                 pred_eval[val_local_mask], y_eval[val_local_mask].float()
@@ -331,6 +393,9 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
             del pred_eval, val_loss, val_local_mask
             del x_eval, y_eval, ei_eval, ea_eval
+
+        _cuda_sync(device)
+        subgraph_eval_times.append(time.time() - t_eval_start)
 
         # Save local state dict on CPU to avoid multi-copy GPU residency.
         local_states.append({k: v.clone().cpu() for k, v in model.state_dict().items()})
@@ -341,19 +406,44 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
+    # ── Compute per-subgraph total times ─────────────────────────────────────
+    # Pad lists to the same length in case some subgraphs were skipped.
+    while len(subgraph_train_times) < len(subgraph_sampling_times):
+        subgraph_train_times.append(0.0)
+    while len(subgraph_eval_times) < len(subgraph_sampling_times):
+        subgraph_eval_times.append(0.0)
+    subgraph_total_times = [
+        s + t + e
+        for s, t, e in zip(
+            subgraph_sampling_times, subgraph_train_times, subgraph_eval_times
+        )
+    ]
+
     # ── Fallback if no valid subgraph was processed ──────────────────────────
     if not local_states:
         model.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
-        _cuda_sync(device)
-        return 0.0, time.time() - epoch_start, sampling_time
+        extra_sgcn = {
+            'local_epochs':               local_epochs,
+            'max_subgraph_pipeline_time': 0.0,
+            'aggregation_time':           0.0,
+            'subgraph_sampling_times':    subgraph_sampling_times,
+            'subgraph_train_times':       subgraph_train_times,
+            'subgraph_eval_times':        subgraph_eval_times,
+            'subgraph_total_times':       subgraph_total_times,
+        }
+        total_sampling_time = sum(subgraph_sampling_times)
+        return 0.0, 0.0, total_sampling_time, extra_sgcn
 
-    # ── 5. Truncation: keep top (1 − truncation_ratio) subgraphs ────────────
+    # ── 6. Truncation: keep top (1 − truncation_ratio) subgraphs ────────────
+    _cuda_sync(device)
+    t_agg_start = time.time()
+
     n_keep     = max(1, int(len(local_states) * (1.0 - truncation_ratio)))
     sorted_idx = sorted(range(len(val_scores)), key=lambda i: val_scores[i],
                         reverse=True)
     kept_idx   = sorted_idx[:n_keep]
 
-    # ── 6. Aggregate local states according to aggregation_method ───────────
+    # ── 7. Aggregate local states according to aggregation_method ───────────
     kept_scores = torch.tensor([val_scores[i] for i in kept_idx], dtype=torch.float)
 
     if aggregation_method == 'avg':
@@ -382,14 +472,36 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         w           = weights.view([-1] + [1] * (stacked.dim() - 1))
         agg_state[key] = (stacked * w).sum(dim=0).to(epoch_init_state[key].dtype)
 
-    # ── 7. Load aggregated state; clear stale optimiser momentum ────────────
+    # ── 8. Load aggregated state; clear stale optimiser momentum ────────────
     model.load_state_dict({k: v.to(device) for k, v in agg_state.items()})
     optimizer.state.clear()
 
     _cuda_sync(device)
-    epoch_time = time.time() - epoch_start
-    avg_loss   = loss_sum / valid_batches if valid_batches > 0 else 0.0
-    return avg_loss, epoch_time, sampling_time
+    aggregation_time = time.time() - t_agg_start
+
+    # ── Compute parallel-pipeline epoch time ────────────────────────────────
+    # max_subgraph_pipeline_time: the slowest subgraph's end-to-end time.
+    # sgcn_epoch_time_max models the wall-clock time when all R subgraphs
+    # run in parallel, finishing when the slowest one completes, followed by
+    # the aggregation step.
+    #   sgcn_epoch_time_max = max_r(sample_r + train_r + eval_r)
+    #                         + aggregation_time
+    max_subgraph_pipeline_time = max(subgraph_total_times) if subgraph_total_times else 0.0
+    sgcn_epoch_time_max        = max_subgraph_pipeline_time + aggregation_time
+
+    avg_loss            = loss_sum / valid_batches if valid_batches > 0 else 0.0
+    total_sampling_time = sum(subgraph_sampling_times)
+
+    extra_sgcn = {
+        'local_epochs':               local_epochs,
+        'max_subgraph_pipeline_time': max_subgraph_pipeline_time,
+        'aggregation_time':           aggregation_time,
+        'subgraph_sampling_times':    subgraph_sampling_times,
+        'subgraph_train_times':       subgraph_train_times,
+        'subgraph_eval_times':        subgraph_eval_times,
+        'subgraph_total_times':       subgraph_total_times,
+    }
+    return avg_loss, sgcn_epoch_time_max, total_sampling_time, extra_sgcn
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device,
@@ -554,6 +666,7 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         truncation_ratio=0.2,
         aggregation_method='sgcn',
         n_subgraphs=5,
+        local_epochs=5,
         subgraph_max_nodes=256,
         max_subgraph_edges=300000,
         debug_subgraph_stats=False):
@@ -628,10 +741,11 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 train_idx, use_labels, n_classes
             )
         elif mpnn == 'sgcn':
-            loss, epoch_time, sampling_time = train_epoch_sgcn(
+            loss, epoch_time, sampling_time, extra_sgcn = train_epoch_sgcn(
                 model, data, criterion, optimizer, device,
                 train_idx, val_idx,
                 n_subgraphs=n_subgraphs,
+                local_epochs=local_epochs,
                 subsampling_method=subsampling_method,
                 subgraph_max_nodes=subgraph_max_nodes,
                 max_subgraph_edges=max_subgraph_edges,
@@ -654,6 +768,20 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             'train_epoch_time':    epoch_time,
             'eval_time':           float('nan'),
         }
+
+        # For SGCN, add detailed timing fields from the parallel-pipeline model.
+        # epoch_time already holds sgcn_epoch_time_max for SGCN.
+        if mpnn == 'sgcn':
+            record.update({
+                'local_epochs':               extra_sgcn['local_epochs'],
+                'max_subgraph_pipeline_time': extra_sgcn['max_subgraph_pipeline_time'],
+                'aggregation_time':           extra_sgcn['aggregation_time'],
+                'sgcn_epoch_time_max':        epoch_time,
+                'subgraph_sampling_times':    extra_sgcn['subgraph_sampling_times'],
+                'subgraph_train_times':       extra_sgcn['subgraph_train_times'],
+                'subgraph_eval_times':        extra_sgcn['subgraph_eval_times'],
+                'subgraph_total_times':       extra_sgcn['subgraph_total_times'],
+            })
 
         if epoch == n_epochs or epoch % eval_every == 0 or epoch % log_every == 0:
             (train_score, val_score, test_score,
