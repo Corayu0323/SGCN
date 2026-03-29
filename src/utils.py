@@ -20,7 +20,7 @@ def set_seed(seed_val=0):
 
 
 def load_data(dataset_name):
-    dataset_obj = PygNodePropPredDataset(name=dataset_name, root='data/ogb')
+    dataset_obj = PygNodePropPredDataset(name=dataset_name, root='/mnt/SGCN/dataset')
     evaluator   = Evaluator(name=dataset_name)
     split_idx   = dataset_obj.get_idx_split()
     train_idx   = split_idx['train']
