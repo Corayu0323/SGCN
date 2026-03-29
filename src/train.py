@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import time
@@ -30,7 +31,7 @@ _SGCN_MIN_TRAIN_NODES = 32
 _SGCN_VAL_SAMPLE_SIZE = 512
 
 def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
-                           subgraph_max_nodes=None):
+                           subgraph_max_nodes=None, unsampled_nodes=None):
     """Return a 1-D sorted LongTensor of sampled node indices.
 
     Supported methods
@@ -45,29 +46,88 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
     subgraph_max_nodes : int or None
         When provided, overrides *n_sample* as the hard upper bound on the
         number of returned nodes.  Has priority over the ratio-based value.
+    unsampled_nodes : 1-D LongTensor or None
+        Nodes not yet covered in the current epoch.  When provided, each
+        sampling method prioritises these nodes so that the sequence of
+        subgraphs collectively covers the whole graph before revisiting
+        already-sampled regions.
     """
     # subgraph_max_nodes takes priority over the ratio-derived n_sample.
     if subgraph_max_nodes is not None and subgraph_max_nodes > 0:
         n_sample = subgraph_max_nodes
     n_sample = min(n_sample, n_nodes)
 
+    # Determine whether there are meaningful unsampled nodes to prioritise.
+    has_priority = (
+        unsampled_nodes is not None and len(unsampled_nodes) > 0
+    )
+
     if method == 'random_node':
+        if has_priority:
+            n_priority = len(unsampled_nodes)
+            if n_priority >= n_sample:
+                # Enough unsampled nodes to fill the quota entirely.
+                perm = torch.randperm(n_priority)[:n_sample]
+                return unsampled_nodes[perm].sort().values
+            else:
+                # Take all unsampled nodes, then fill remainder from the rest.
+                remaining = n_sample - n_priority
+                sampled_mask = torch.ones(n_nodes, dtype=torch.bool)
+                sampled_mask[unsampled_nodes] = False
+                sampled_pool = sampled_mask.nonzero(as_tuple=False).squeeze(1)
+                perm = torch.randperm(len(sampled_pool))[:remaining]
+                return torch.cat([unsampled_nodes,
+                                  sampled_pool[perm]]).sort().values
         perm = torch.randperm(n_nodes)[:n_sample]
         return perm.sort().values
 
     elif method == 'random_edge':
-        n_edges   = edge_index.shape[1]
-        edge_perm = torch.randperm(n_edges)[:min(n_sample * 2, n_edges)]
-        nodes     = edge_index[:, edge_perm].flatten().unique()
-        if len(nodes) < n_sample:
-            extra = torch.randperm(n_nodes)[:n_sample - len(nodes)]
-            nodes = torch.cat([nodes, extra]).unique()
-        return nodes[:n_sample].sort().values
+        n_edges = edge_index.shape[1]
+        if has_priority:
+            # Build a boolean mask of priority nodes, then select edges that
+            # touch at least one priority node first.
+            prio_mask = torch.zeros(n_nodes, dtype=torch.bool)
+            prio_mask[unsampled_nodes] = True
+            edge_has_prio = prio_mask[edge_index[0]] | prio_mask[edge_index[1]]
+            prio_edges  = edge_has_prio.nonzero(as_tuple=False).squeeze(1)
+            other_edges = (~edge_has_prio).nonzero(as_tuple=False).squeeze(1)
+
+            n_prio_sample = min(n_sample * 2, len(prio_edges))
+            perm_p  = torch.randperm(len(prio_edges))[:n_prio_sample]
+            chosen  = edge_index[:, prio_edges[perm_p]].flatten().unique()
+
+            if len(chosen) < n_sample and len(other_edges) > 0:
+                extra_e = other_edges[
+                    torch.randperm(len(other_edges))[:n_sample * 2]
+                ]
+                extra_n = edge_index[:, extra_e].flatten().unique()
+                chosen  = torch.cat([chosen, extra_n]).unique()
+        else:
+            edge_perm = torch.randperm(n_edges)[:min(n_sample * 2, n_edges)]
+            chosen    = edge_index[:, edge_perm].flatten().unique()
+
+        if len(chosen) < n_sample:
+            extra = torch.randperm(n_nodes)[:n_sample - len(chosen)]
+            chosen = torch.cat([chosen, extra]).unique()
+        return chosen[:n_sample].sort().values
 
     elif method in ('random_walk', 'snowball'):
-        n_seeds  = min(max(n_sample // _SGCN_SEED_RATIO, 1), len(train_idx_cpu))
-        seed_perm = torch.randperm(len(train_idx_cpu))[:n_seeds]
-        seeds     = train_idx_cpu[seed_perm]
+        # Build the seed pool: prefer training nodes inside unsampled regions.
+        if has_priority:
+            prio_train = unsampled_nodes[
+                torch.isin(unsampled_nodes, train_idx_cpu)
+            ]
+            if len(prio_train) > 0:
+                seed_pool = prio_train
+            else:
+                # Fall back to any unsampled node as seeds.
+                seed_pool = unsampled_nodes
+        else:
+            seed_pool = train_idx_cpu
+
+        n_seeds   = min(max(n_sample // _SGCN_SEED_RATIO, 1), len(seed_pool))
+        seed_perm = torch.randperm(len(seed_pool))[:n_seeds]
+        seeds     = seed_pool[seed_perm]
 
         visited = torch.zeros(n_nodes, dtype=torch.bool)
         visited[seeds] = True
@@ -88,8 +148,8 @@ def _sample_subgraph_nodes(edge_index, n_nodes, train_idx_cpu, method, n_sample,
             perm = torch.randperm(len(visited_nodes))[:n_sample]
             return visited_nodes[perm].sort().values
         elif len(visited_nodes) < n_sample:
-            unvisited   = (~visited).nonzero(as_tuple=False).squeeze(1)
-            extra_perm  = torch.randperm(len(unvisited))[:n_sample - len(visited_nodes)]
+            unvisited  = (~visited).nonzero(as_tuple=False).squeeze(1)
+            extra_perm = torch.randperm(len(unvisited))[:n_sample - len(visited_nodes)]
             return torch.cat([visited_nodes, unvisited[extra_perm]]).sort().values
 
         return visited_nodes.sort().values
@@ -123,6 +183,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     1. Sample a subgraph of at most *subgraph_max_nodes* nodes using the
        chosen *subsampling_method*.  *subgraph_ratio* is used as a fallback
        when *subgraph_max_nodes* is not set (i.e. <= 0).
+       Nodes not yet covered in this epoch are prioritised so that the
+       sequence of subgraphs collectively covers the whole graph.
     2. Enforce a hard edge-count limit of *max_subgraph_edges* by randomly
        dropping edges when the induced subgraph exceeds that threshold.
     3. Reset the model to the epoch-start parameters (every subgraph starts
@@ -141,6 +203,15 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     * Aggregate the remaining local states according to *aggregation_method*.
     * Load the aggregated state into the model and clear stale optimizer
       momentum.
+
+    Coverage guarantee
+    ------------------
+    When *n_subgraphs* <= 0 the count is derived automatically:
+        n_subgraphs = ceil(n_nodes / nodes_per_subgraph)
+    so that n_subgraphs × nodes_per_subgraph ≥ n_nodes (full graph coverage).
+    Within each epoch an ``epoch_sampled_mask`` tracks which nodes have been
+    covered; subsequent subgraphs receive the uncovered nodes as a priority
+    pool and sample from them first.
 
     Timing
     ------
@@ -162,6 +233,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     Parameters
     ----------
     n_subgraphs         : int   – number of independent subgraphs per epoch.
+                                   Set <= 0 to auto-derive from coverage
+                                   constraint (ceil(n_nodes / n_sample)).
     local_epochs        : int   – number of local gradient steps per subgraph
                                    (L in the paper).  Default: 5.
     subsampling_method  : str   – one of 'random_node', 'random_edge',
@@ -211,6 +284,13 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         n_sample = max(1, int(n_nodes * subgraph_ratio))
     edge_index_cpu = data.edge_index.cpu()
 
+    # Auto-derive n_subgraphs when not explicitly set so that the product
+    # n_subgraphs × n_sample >= n_nodes (full-graph coverage guarantee).
+    # n_sample already reflects subgraph_max_nodes (set above), so this
+    # formula uses the actual per-subgraph node budget.
+    if n_subgraphs is None or n_subgraphs <= 0:
+        n_subgraphs = math.ceil(n_nodes / n_sample)
+
     # Snapshot of model parameters at the start of this epoch.  Every local
     # subgraph model is initialised from this state so that aggregation is
     # well-defined and subgraphs are fully independent of each other.
@@ -228,14 +308,28 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     subgraph_train_times    = []
     subgraph_eval_times     = []
 
+    # Epoch-level coverage mask: tracks which nodes have been included in at
+    # least one subgraph so far.  Unsampled nodes are fed as a priority pool
+    # to each successive sampler, ensuring the sequence of subgraphs covers
+    # the entire graph before revisiting already-sampled regions.
+    epoch_sampled_mask = torch.zeros(n_nodes, dtype=torch.bool)
+
     for _sg in range(n_subgraphs):
         # ── 1. Sample subgraph node indices ─────────────────────────────────
         _cuda_sync(device)
         t_sample_start = time.time()
 
+        # Pass nodes not yet visited this epoch as a priority pool.
+        unsampled_nodes = epoch_sampled_mask.logical_not().nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        if len(unsampled_nodes) == 0:
+            unsampled_nodes = None
+
         node_idx  = _sample_subgraph_nodes(
             edge_index_cpu, n_nodes, train_idx_cpu, subsampling_method, n_sample,
             subgraph_max_nodes=subgraph_max_nodes,
+            unsampled_nodes=unsampled_nodes,
         )
 
         # Guarantee at least a few training nodes are included.
@@ -245,6 +339,10 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
             ]
             node_idx = torch.cat([node_idx, extra]).unique()
             node_idx = node_idx.sort().values
+
+        # Mark these nodes as covered for the remainder of this epoch so that
+        # subsequent subgraphs are biased toward the still-uncovered region.
+        epoch_sampled_mask[node_idx] = True
 
         # ── 2. Extract induced subgraph ──────────────────────────────────────
         edge_index_sub, edge_attr_sub = pyg_subgraph(
