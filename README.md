@@ -66,14 +66,12 @@ Each subgraph is trained:
 
 Keep only top-performing subgraphs:
 
-```math
 l_{\text{top}} = \text{Top}_{\rho}(s_1, \dots, s_R)
 
 ---
 
 ### 3.4 Parameter Aggregation
 
-```math
 \tilde{\theta} = \sum_{r \in l_{\text{top}}} w_r \theta_r
 
 * `sgcn` (softmax weighting)
