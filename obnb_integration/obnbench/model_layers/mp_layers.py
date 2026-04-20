@@ -33,9 +33,11 @@ class BaseConvMixin:
         use_edge_feature: bool = True,
         **kwargs,
     ):
-        # Set up forward function dependending on the edge usage capabilities
-        # of the wrapped convolution module
-        if self._edge_usage == "none" or use_edge_feature:
+        # Set up forward function depending on the edge usage capabilities
+        # of the wrapped convolution module.
+        # Use simple (no-edge) forward when: the conv does not support edges,
+        # OR the caller explicitly opts out of edge features.
+        if self._edge_usage == "none" or not use_edge_feature:
             self._forward = self._forward_simple
         elif self._edge_usage == "edge_weight":
             self._forward = self._forward_edgeweight
