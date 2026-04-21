@@ -99,6 +99,8 @@ def load_obnb_data(graph_name, label_name, encoder_type='one_hot_log_deg',
     * ``use_labels`` is **not** supported for obnb datasets.  Keep
       ``USE_LABELS = False`` when using this loader.
     """
+    # Lazy import: obnb is an optional dependency.  Importing at module level
+    # would break the rest of the codebase for users who have not installed it.
     from obnb.dataset import OpenBiomedNetBench
 
     if encoder_type == 'adj':
