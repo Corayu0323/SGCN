@@ -9,6 +9,140 @@ from torch_geometric.utils import scatter
 from .models import GNN_PyG
 
 
+# ── obnb helpers ─────────────────────────────────────────────────────────────
+
+class OBNBEvaluator:
+    """Evaluator for obnb datasets.
+
+    Mimics the OGB Evaluator interface so it can be used as a drop-in
+    replacement inside ``run()``.
+
+    Usage
+    -----
+    evaluator = OBNBEvaluator()
+    result    = evaluator.eval({'y_pred': pred_tensor, 'y_true': true_tensor})
+    rocauc    = result['rocauc']   # mean ROC-AUC across all tasks
+    """
+
+    def eval(self, input_dict):
+        """Compute mean ROC-AUC across all tasks.
+
+        Parameters
+        ----------
+        input_dict : dict
+            Must contain:
+              'y_pred' – Tensor or ndarray of shape (n_nodes, n_tasks).
+                         Raw logits are accepted (rank-equivalent to probs).
+              'y_true' – Tensor or ndarray of shape (n_nodes, n_tasks).
+                         Binary labels.
+
+        Returns
+        -------
+        dict with key 'rocauc' → float (mean across tasks that have >1 class).
+        """
+        from sklearn.metrics import roc_auc_score
+
+        y_pred = input_dict['y_pred']
+        y_true = input_dict['y_true']
+
+        if isinstance(y_pred, torch.Tensor):
+            y_pred = y_pred.detach().cpu().numpy()
+        if isinstance(y_true, torch.Tensor):
+            y_true = y_true.detach().cpu().numpy()
+
+        scores = []
+        for t in range(y_true.shape[1]):
+            gt = y_true[:, t]
+            pd = y_pred[:, t]
+            # Skip tasks where only one class is present in this split.
+            if len(np.unique(gt)) > 1:
+                scores.append(roc_auc_score(gt, pd))
+
+        mean_auc = float(np.mean(scores)) if scores else 0.0
+        return {'rocauc': mean_auc}
+
+
+def load_obnb_data(graph_name, label_name, encoder_type='one_hot_log_deg',
+                   root='datasets', version='current'):
+    """Load an obnb biomedical network benchmark dataset.
+
+    Parameters
+    ----------
+    graph_name : str
+        Name of the biological network, e.g. 'BioGRID', 'STRING', 'HumanNet'.
+    label_name : str
+        Name of the label set, e.g. 'DisGeNET', 'GOBP', 'GOMF'.
+    encoder_type : str
+        Node-feature encoding strategy:
+          'one_hot_log_deg' – 32-dim one-hot encoded log degree (default).
+          'adj'             – row of the dense adjacency matrix (n_nodes-dim).
+    root : str
+        Root directory for caching downloaded obnb data (default: 'datasets').
+    version : str
+        Data version: 'current' (archived), 'latest' (download from source),
+        or a specific version string (default: 'current').
+
+    Returns
+    -------
+    data       : torch_geometric.data.Data – full graph with node features/labels.
+    train_idx  : LongTensor – training node indices.
+    val_idx    : LongTensor – validation node indices.
+    test_idx   : LongTensor – test node indices.
+    evaluator  : OBNBEvaluator – compatible with run()'s evaluator interface.
+
+    Notes
+    -----
+    * ``data.y`` has shape ``(num_nodes, num_tasks)``; ``num_tasks`` depends on
+      the chosen network/label combination.
+    * The study-bias holdout split is gene-level (based on PubMed citation
+      count), so the same train/val/test assignment applies to all tasks.
+    * ``use_labels`` is **not** supported for obnb datasets.  Keep
+      ``USE_LABELS = False`` when using this loader.
+    """
+    from obnb.dataset import OpenBiomedNetBench
+
+    if encoder_type == 'adj':
+        graph_as_feature    = True
+        use_dense_graph     = True
+        auto_generate_feature = None
+    elif encoder_type == 'one_hot_log_deg':
+        graph_as_feature    = False
+        use_dense_graph     = False
+        auto_generate_feature = 'OneHotLogDeg'
+    else:
+        raise ValueError(
+            f"Unknown encoder_type: {encoder_type!r}. "
+            "Choose from: 'one_hot_log_deg', 'adj'."
+        )
+
+    dataset = OpenBiomedNetBench(
+        root=root,
+        graph_name=graph_name,
+        label_name=label_name,
+        version=version,
+        graph_as_feature=graph_as_feature,
+        use_dense_graph=use_dense_graph,
+        auto_generate_feature=auto_generate_feature,
+    )
+    data = dataset.to_pyg_data()
+
+    # Derive global split indices from per-task masks.
+    # obnb study-bias splits are gene-level (driven by PubMedCount), so every
+    # task column contains the same binary assignment.  Column 0 is used as the
+    # canonical global indicator.
+    def _mask_to_idx(mask):
+        if mask.dim() == 2:
+            mask = mask[:, 0]
+        return mask.nonzero(as_tuple=False).squeeze(1)
+
+    train_idx = _mask_to_idx(data.train_mask)
+    val_idx   = _mask_to_idx(data.val_mask)
+    test_idx  = _mask_to_idx(data.test_mask)
+
+    evaluator = OBNBEvaluator()
+    return data, train_idx, val_idx, test_idx, evaluator
+
+
 def set_seed(seed_val=0):
     random.seed(seed_val)
     np.random.seed(seed_val)
