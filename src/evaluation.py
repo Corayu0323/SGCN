@@ -1,3 +1,8 @@
+import argparse
+import glob
+import json
+from pathlib import Path
+
 import torch
 import pandas as pd
 
@@ -141,3 +146,175 @@ def compute_tpr_violation(probs, go_parents, node_mask=None, verbose=False):
         print("============================================")
 
     return float(violation_rate), stats
+
+
+def _load_tensor(path, key=None):
+    """Load a tensor-like object from .pt/.pth, .npy, or csv/txt files."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+
+    if suffix in {'.pt', '.pth'}:
+        obj = torch.load(path, map_location='cpu')
+        if isinstance(obj, dict):
+            if key is not None:
+                if key not in obj:
+                    raise KeyError(f"Key '{key}' not found in {path}")
+                obj = obj[key]
+            else:
+                for candidate in ('probs', 'prob', 'pred', 'preds', 'y_pred', 'logits'):
+                    if candidate in obj:
+                        obj = obj[candidate]
+                        break
+                else:
+                    keys = ', '.join(obj.keys())
+                    raise ValueError(
+                        f"{path} contains a dict. Pass --probs-key. Available keys: {keys}"
+                    )
+        return obj if torch.is_tensor(obj) else torch.as_tensor(obj)
+
+    if suffix == '.npy':
+        import numpy as np
+
+        return torch.as_tensor(np.load(path))
+
+    if suffix in {'.csv', '.txt'}:
+        return torch.as_tensor(pd.read_csv(path, header=None).values)
+
+    raise ValueError(f"Unsupported tensor file extension: {path.suffix}")
+
+
+def _default_project_root():
+    return Path(__file__).resolve().parents[1]
+
+
+def _default_go_parents_path():
+    return _default_project_root() / 'dataset' / 'ogbn_proteins' / 'mapping' / 'go_parents.csv'
+
+
+def _find_latest_prediction():
+    project_root = _default_project_root()
+    candidates = []
+    search_dirs = list((project_root / 'results').glob('*/preds'))
+    search_dirs.append(project_root / 'output')
+
+    for search_dir in search_dirs:
+        for pattern in ('*.pt', '*.pth', '*.npy', '*.csv'):
+            candidates.extend(glob.glob(str(search_dir / pattern)))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: Path(p).stat().st_mtime)
+
+
+def _load_split_indices(split):
+    try:
+        from ogb.nodeproppred import PygNodePropPredDataset
+    except ImportError as exc:
+        raise ImportError(
+            "Loading --split requires ogb. Install ogb or pass --node-mask explicitly."
+        ) from exc
+
+    dataset = PygNodePropPredDataset(
+        name='ogbn-proteins',
+        root=str(_default_project_root() / 'dataset'),
+    )
+    split_idx = dataset.get_idx_split()
+    return split_idx[split]
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description="Compute GO True Path Rule violation rate from saved model predictions.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        '--probs',
+        default=None,
+        help=(
+            "Path to saved probabilities/logits (.pt, .pth, .npy, .csv). "
+            "If omitted, the latest file in ../results/*/preds or ../output is used."
+        ),
+    )
+    parser.add_argument(
+        '--probs-key',
+        default=None,
+        help="Key to read when --probs points to a torch-saved dict.",
+    )
+    parser.add_argument(
+        '--logits',
+        action='store_true',
+        help="Treat input as logits and apply sigmoid before computing violations.",
+    )
+    parser.add_argument(
+        '--go-parents',
+        default=str(_default_go_parents_path()),
+        help="Path to go_parents.csv with child_idx and parent_idx columns.",
+    )
+    parser.add_argument(
+        '--node-mask',
+        default=None,
+        help="Optional boolean mask or index tensor file (.pt, .pth, .npy, .csv, .txt).",
+    )
+    parser.add_argument(
+        '--mask-key',
+        default=None,
+        help="Key to read when --node-mask points to a torch-saved dict.",
+    )
+    parser.add_argument(
+        '--split',
+        choices=('train', 'valid', 'test'),
+        default=None,
+        help="Evaluate on an OGB split. Ignored if --node-mask is provided.",
+    )
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help="Also print stats as one JSON object for logs/tables.",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    probs_path = args.probs or _find_latest_prediction()
+    if probs_path is None:
+        parser.print_help()
+        print()
+        print("No prediction file found in ../results/*/preds or ../output.")
+        print("Set SAVE_PRED=True in the notebook/training config, run training, then rerun:")
+        print("  python src/evaluation.py --split test")
+        return 1
+
+    probs = _load_tensor(probs_path, args.probs_key).float()
+    if args.logits:
+        probs = torch.sigmoid(probs)
+
+    go_parents = pd.read_csv(args.go_parents)
+
+    node_mask = None
+    if args.node_mask is not None:
+        node_mask = _load_tensor(args.node_mask, args.mask_key)
+    elif args.split is not None:
+        node_mask = _load_split_indices(args.split)
+
+    print(f"Prediction file: {probs_path}")
+    print(f"GO parent file: {args.go_parents}")
+    print(f"Evaluation split: {args.split if args.node_mask is None else args.node_mask}")
+
+    violation_rate, stats = compute_tpr_violation(
+        probs=probs,
+        go_parents=go_parents,
+        node_mask=node_mask,
+        verbose=True,
+    )
+
+    if args.json:
+        print(json.dumps(stats, ensure_ascii=False))
+
+    print(f"TPR Violation Rate: {violation_rate:.6f}")
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
