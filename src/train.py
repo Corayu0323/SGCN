@@ -919,7 +919,8 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         min_subgraph_nodes=0,
         min_train_nodes_in_subgraph=_SGCN_MIN_TRAIN_NODES,
         data_train=None,
-        data_eval=None):
+        data_eval=None,
+        pred_dir='./output'):
     evaluator_wrapper = lambda pred, lbls: evaluator.eval(
         {'y_pred': pred, 'y_true': lbls}
     )['rocauc']
@@ -1139,8 +1140,10 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     total_run_time = time.time() - run_start
 
     if save_pred and final_pred is not None:
-        os.makedirs('./output', exist_ok=True)
-        torch.save(torch.sigmoid(final_pred), f'./output/{n_running}.pt')
+        os.makedirs(pred_dir, exist_ok=True)
+        pred_path = os.path.join(pred_dir, f'{n_running}.pt')
+        torch.save(torch.sigmoid(final_pred), pred_path)
+        print(f'Saved predictions to {pred_path}')
 
     return {
         'best_val_auc':   best_val_score,
