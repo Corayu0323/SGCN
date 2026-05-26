@@ -269,7 +269,8 @@ def preprocess(data, train_idx, n_classes):
 
 
 def gen_model(n_node_feats, n_classes, use_labels, n_layers, n_hidden,
-              dropout, input_drop, edge_drop, mpnn, jk):
+              dropout, input_drop, edge_drop, mpnn, jk,
+              gcn_cached=False):
     n_feats = (n_node_feats + n_classes) if use_labels else n_node_feats
     return GNN_PyG(
         n_feats,
@@ -282,6 +283,7 @@ def gen_model(n_node_feats, n_classes, use_labels, n_layers, n_hidden,
         edge_drop=edge_drop,
         mpnn=mpnn,
         jk=jk,
+        gcn_cached=gcn_cached,
     )
 
 
