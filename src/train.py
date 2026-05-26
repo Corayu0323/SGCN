@@ -19,6 +19,15 @@ def _cuda_sync(device):
         torch.cuda.synchronize(device)
 
 
+def _reset_gcn_cache(model):
+    """Clear cached normalized adjacency in all GCNConv layers."""
+    for conv in getattr(model, 'convs', []):
+        if hasattr(conv, '_cached_edge_index'):
+            conv._cached_edge_index = None
+        if hasattr(conv, '_cached_adj_t'):
+            conv._cached_adj_t = None
+
+
 # ── SGCN helpers ─────────────────────────────────────────────────────────────
 
 # Fraction of n_sample used as BFS seed nodes (1/20 = 5%)
@@ -757,6 +766,47 @@ def train_epoch_fullbatch(model, x, edge_index, y, edge_attr, train_idx,
     return loss.item(), epoch_time, 0.0
 
 
+def train_epoch_gcn_sampled(model, dataloader, criterion, optimizer, device,
+                            use_labels=False, n_classes=112):
+    """GCN baseline training epoch with NeighborLoader mini-batches."""
+    model.train()
+    loss_sum, total = 0.0, 0
+    sampling_time   = 0.0
+
+    _cuda_sync(device)
+    epoch_start = time.time()
+
+    loader_iter = iter(dataloader)
+    for _ in range(len(dataloader)):
+        t_sample = time.time()
+        batch = next(loader_iter)
+        sampling_time += time.time() - t_sample
+
+        batch = batch.to(device)
+        batch_size = batch.batch_size
+
+        if use_labels:
+            non_seed_idx = torch.arange(batch_size, batch.x.shape[0], device=device)
+            x = add_labels(batch.x, batch.train_labels_onehot, non_seed_idx, n_classes, device)
+        else:
+            x = batch.x
+
+        pred = model(x, batch.edge_index, getattr(batch, 'edge_attr', None))
+        loss = criterion(pred[:batch_size], batch.y[:batch_size].float())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        loss_sum += loss.item() * batch_size
+        total += batch_size
+
+    _cuda_sync(device)
+    epoch_time = time.time() - epoch_start
+
+    return (loss_sum / total if total > 0 else 0.0), epoch_time, sampling_time
+
+
 @torch.no_grad()
 def evaluate_fullbatch(model, x, edge_index, labels, edge_attr,
                        train_idx, val_idx, test_idx,
@@ -908,6 +958,12 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         gen_model_fn, device, n_layers, lr, weight_decay, n_epochs,
         eval_every, log_every, save_pred, use_labels=False, n_classes=112,
         mpnn='gcn',
+        gcn_train_mode='sampled',
+        gcn_fanout=None,
+        gcn_batch_size=None,
+        gcn_num_workers=4,
+        gcn_eval_batch_size=32768,
+        gcn_eval_fanout=None,
         subsampling_method='random_node',
         truncation_ratio=0.2,
         aggregation_method='sgcn',
@@ -925,7 +981,16 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         {'y_pred': pred, 'y_true': lbls}
     )['rocauc']
 
+    if gcn_train_mode not in ('full', 'sampled'):
+        raise ValueError(
+            f"Unknown gcn_train_mode: {gcn_train_mode!r}. Choose from: 'full', 'sampled'."
+        )
+
+    gcn_fanout = [16] * n_layers if gcn_fanout is None else gcn_fanout
+    gcn_eval_fanout = [32] * n_layers if gcn_eval_fanout is None else gcn_eval_fanout
+
     train_batch_size = (len(train_idx) + 9) // 10
+    gcn_batch_size = train_batch_size if gcn_batch_size is None else gcn_batch_size
     data_train = data if data_train is None else data_train
     data_eval = data if data_eval is None else data_eval
 
@@ -954,8 +1019,18 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         # no external DataLoader is required.
         train_loader = None
     elif mpnn == 'gcn':
-        # GCN uses full-batch training; no DataLoader is required.
-        train_loader = None
+        if gcn_train_mode == 'sampled':
+            train_loader = NeighborLoader(
+                data_train,
+                num_neighbors=gcn_fanout,
+                batch_size=gcn_batch_size,
+                input_nodes=train_idx.cpu(),
+                shuffle=True,
+                num_workers=gcn_num_workers,
+            )
+        else:
+            # Full-batch GCN does not require DataLoader.
+            train_loader = None
     else:
         train_loader = NeighborLoader(
             data_train,
@@ -966,7 +1041,16 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             num_workers=4,
         )
 
-    if mpnn != 'gcn':
+    if mpnn == 'gcn' and gcn_train_mode == 'sampled':
+        eval_loader = NeighborLoader(
+            data_eval,
+            num_neighbors=gcn_eval_fanout,
+            batch_size=gcn_eval_batch_size,
+            input_nodes=torch.cat([train_idx.cpu(), val_idx.cpu(), test_idx.cpu()]),
+            shuffle=False,
+            num_workers=gcn_num_workers,
+        )
+    elif mpnn != 'gcn':
         eval_loader = NeighborLoader(
             data_eval,
             num_neighbors=[32] * n_layers,
@@ -980,6 +1064,12 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
 
     criterion    = nn.BCEWithLogitsLoss()
     model        = gen_model_fn().to(device)
+    if mpnn == 'gcn':
+        gcn_use_cache = (gcn_train_mode == 'full')
+        for conv in getattr(model, 'convs', []):
+            if hasattr(conv, 'cached'):
+                conv.cached = gcn_use_cache
+        _reset_gcn_cache(model)
     optimizer    = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.75, patience=50, verbose=True
@@ -1010,7 +1100,7 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         _sgcn_train_idx_dev = _sgcn_val_idx_dev = None
 
     # ── GCN: pre-load full graph to GPU for full-batch training/evaluation. ──
-    if mpnn == 'gcn':
+    if mpnn == 'gcn' and gcn_train_mode == 'full':
         _gcn_x_train_dev          = data_train.x.to(device)
         _gcn_edge_index_train_dev = data_train.edge_index.to(device)
         train_edge_attr = getattr(data_train, 'edge_attr', None)
@@ -1026,6 +1116,8 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         _gcn_x_train_dev = _gcn_edge_index_train_dev = _gcn_edge_attr_train_dev = None
         _gcn_x_eval_dev = _gcn_edge_index_eval_dev = _gcn_edge_attr_eval_dev = None
         _gcn_train_idx_dev = _gcn_val_idx_dev = _gcn_test_idx_dev = None
+
+    gcn_cached_graph_mode = None
 
     _cuda_sync(device)
     run_start = time.time()
@@ -1058,7 +1150,15 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 min_subgraph_nodes=min_subgraph_nodes,
                 min_train_nodes_in_subgraph=min_train_nodes_in_subgraph,
             )
+        elif mpnn == 'gcn' and gcn_train_mode == 'sampled':
+            loss, epoch_time, sampling_time = train_epoch_gcn_sampled(
+                model, train_loader, criterion, optimizer, device,
+                use_labels=use_labels, n_classes=n_classes
+            )
         elif mpnn == 'gcn':
+            if gcn_cached_graph_mode != 'train':
+                _reset_gcn_cache(model)
+                gcn_cached_graph_mode = 'train'
             loss, epoch_time, sampling_time = train_epoch_fullbatch(
                 model, _gcn_x_train_dev, _gcn_edge_index_train_dev, labels, _gcn_edge_attr_train_dev,
                 _gcn_train_idx_dev, criterion, optimizer, device,
@@ -1095,7 +1195,10 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             })
 
         if epoch == n_epochs or epoch % eval_every == 0 or epoch % log_every == 0:
-            if mpnn == 'gcn':
+            if mpnn == 'gcn' and gcn_train_mode == 'full':
+                if gcn_cached_graph_mode != 'eval':
+                    _reset_gcn_cache(model)
+                    gcn_cached_graph_mode = 'eval'
                 (train_score, val_score, test_score,
                  train_loss, val_loss, test_loss,
                  pred, eval_time) = evaluate_fullbatch(

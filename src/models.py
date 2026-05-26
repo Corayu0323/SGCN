@@ -19,6 +19,7 @@ class GNN_PyG(nn.Module):
         edge_drop,
         mpnn='gcn',
         jk=False,
+        gcn_cached=False,
     ):
         super().__init__()
         self.n_layers  = n_layers
@@ -35,11 +36,13 @@ class GNN_PyG(nn.Module):
         for i in range(n_layers):
             if mpnn == 'sage':
                 self.convs.append(SAGEConv(n_hidden, n_hidden))
-            else:  # gcn / graphsaint / sgcn
+            elif mpnn == 'gcn':
+                self.convs.append(GCNConv(n_hidden, n_hidden, cached=gcn_cached))
+            else:  # graphsaint / sgcn
                 # GraphSAINT and SGCN both use standard GCN convolution; their
                 # key differences are in subgraph-level sampling and aggregation
                 # strategies during training (handled in train.py).
-                self.convs.append(GCNConv(n_hidden, n_hidden, add_self_loops=False))
+                self.convs.append(GCNConv(n_hidden, n_hidden, cached=False))
 
             self.norms.append(nn.BatchNorm1d(n_hidden))
 
