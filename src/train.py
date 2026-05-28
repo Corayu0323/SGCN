@@ -588,7 +588,6 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                     for param in model.parameters()
                     if param.grad is not None
                 )
-                num_samples_local += train_nodes_this_subgraph
             optimizer.step()
 
             last_loss = loss.item()
@@ -596,6 +595,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
         _cuda_sync(device)
         subgraph_train_times.append(time.time() - t_train_start)
+        if track_fisher:
+            num_samples_local = train_nodes_this_subgraph * local_epochs
 
         loss_sum      += last_loss
         valid_batches += 1
