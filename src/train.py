@@ -29,7 +29,7 @@ _SGCN_RANDOM_WALK_MAX_HOPS = 10
 _SGCN_MIN_TRAIN_NODES = 32
 # Number of validation nodes sampled for the per-subgraph quality score
 _SGCN_VAL_SAMPLE_SIZE = 512
-_FISHER_EPS = 1e-8
+_FISHER_TRACE_EPSILON = 1e-8
 
 
 def compute_fisher_trace(model, dataloader):
@@ -64,7 +64,9 @@ def compute_fisher_trace(model, dataloader):
                 grad_sq_sum += float(param.grad.detach().pow(2).sum().item())
         num_samples += int(batch)
 
-    return grad_sq_sum / max(float(num_samples), _FISHER_EPS)
+    if num_samples <= 0:
+        raise ValueError("num_samples must be > 0 when computing Fisher trace")
+    return grad_sq_sum / (float(num_samples) + _FISHER_TRACE_EPSILON)
 
 
 def aggregate_with_fisher_trace(all_models, all_traces):
@@ -85,10 +87,15 @@ def aggregate_with_fisher_trace(all_models, all_traces):
                 "all_models items must be nn.Module instances or state_dict dictionaries"
             )
     ref_state = states[0]
+    if not ref_state:
+        raise ValueError("state_dict is empty; cannot aggregate")
     device = next(iter(ref_state.values())).device
     traces = torch.as_tensor(all_traces, dtype=torch.float, device=device)
-    traces = torch.clamp(traces, min=0.0) + _FISHER_EPS
-    weights = traces / traces.sum()
+    if (traces < 0).any():
+        raise ValueError("all_traces must be non-negative")
+    weights = (traces + _FISHER_TRACE_EPSILON) / (
+        traces.sum() + _FISHER_TRACE_EPSILON * traces.numel()
+    )
 
     best_idx = None
     agg_state = {}
@@ -391,9 +398,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
     # Move split indices to device so all isin/randperm ops stay on GPU.
     train_idx_dev = train_idx.to(device)
-    if aggregation_method == 'fisher':
-        val_idx_dev = train_idx_dev
-    else:
+    val_idx_dev = None
+    if aggregation_method != 'fisher':
         if val_idx is None:
             raise ValueError("val_idx must be provided when aggregation_method is not 'fisher'")
         val_idx_dev = val_idx.to(device)
@@ -419,7 +425,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     epoch_init_state = {k: v.clone() for k, v in model.state_dict().items()}
 
     local_states  = []
-    val_scores    = []
+    subgraph_scores = []
     loss_sum      = 0.0
     valid_batches = 0
 
@@ -566,6 +572,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         train_mask_dev = train_mask
         last_loss      = 0.0
 
+        track_fisher = aggregation_method == 'fisher'
         grad_sq_sum_local = 0.0
         num_samples_local = 0
         train_nodes_this_subgraph = int(train_mask_dev.sum().item())
@@ -575,12 +582,13 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
             optimizer.zero_grad()
             loss.backward()
-            grad_sq_sum_local += sum(
-                float(param.grad.detach().pow(2).sum().item())
-                for param in model.parameters()
-                if param.grad is not None
-            )
-            num_samples_local += train_nodes_this_subgraph
+            if track_fisher:
+                grad_sq_sum_local += sum(
+                    float(param.grad.detach().pow(2).sum().item())
+                    for param in model.parameters()
+                    if param.grad is not None
+                )
+                num_samples_local += train_nodes_this_subgraph
             optimizer.step()
 
             last_loss = loss.item()
@@ -603,7 +611,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
         if aggregation_method == 'fisher':
             fisher_trace = compute_fisher_trace(
-                model, [{'grad_sq_sum': grad_sq_sum_local, 'num_samples': num_samples_local}]
+                model, [(grad_sq_sum_local, num_samples_local)]
             )
             val_score = fisher_trace
         else:
@@ -668,7 +676,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
         # Save local state dict on GPU; aggregation will run fully on device.
         local_states.append({k: v.clone() for k, v in model.state_dict().items()})
-        val_scores.append(val_score)
+        subgraph_scores.append(val_score)
 
         # Release per-subgraph GPU tensors.
         del x_sub, y_sub, ei_sub, ea_sub, train_mask
@@ -709,14 +717,14 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     t_agg_start = time.time()
 
     n_keep     = max(1, int(len(local_states) * (1.0 - truncation_ratio)))
-    sorted_idx = sorted(range(len(val_scores)), key=lambda i: val_scores[i],
+    sorted_idx = sorted(range(len(subgraph_scores)), key=lambda i: subgraph_scores[i],
                         reverse=True)
     kept_idx   = sorted_idx[:n_keep]
 
     # ── 7. Aggregate local states according to aggregation_method ───────────
     # kept_scores and weights are created directly on device so the entire
     # stacking/weighted-sum stays on GPU without extra PCIe transfers.
-    kept_scores = torch.tensor([val_scores[i] for i in kept_idx],
+    kept_scores = torch.tensor([subgraph_scores[i] for i in kept_idx],
                                dtype=torch.float, device=device)
 
     if aggregation_method == 'avg':
@@ -731,7 +739,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     elif aggregation_method == 'fisher':
         agg_state = aggregate_with_fisher_trace(
             [local_states[i] for i in kept_idx],
-            [val_scores[i] for i in kept_idx],
+            [subgraph_scores[i] for i in kept_idx],
         )
     else:
         # Default 'sgcn': softmax-weighted average over validation scores
