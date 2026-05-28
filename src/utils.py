@@ -131,7 +131,7 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
     selected_starts = torch.searchsorted(inc_nodes_sorted, selected_nodes, right=False).tolist()
     selected_ends = torch.searchsorted(inc_nodes_sorted, selected_nodes, right=True).tolist()
     for node, start, end in zip(selected_nodes_list, selected_starts, selected_ends):
-        incident_ids = torch.unique(inc_edge_ids_sorted[start:end])
+        incident_ids = inc_edge_ids_sorted[start:end]
         degree = int(incident_ids.numel())
         broken_per_node[node] = degree
         if degree > 0:
