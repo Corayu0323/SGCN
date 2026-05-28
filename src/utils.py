@@ -9,18 +9,18 @@ from torch_geometric.utils import coalesce, remove_self_loops, scatter, to_undir
 from .models import GNN_PyG
 
 
-def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
+def apply_ood_perturbation(data, Pood, Pcr, seed):
     """Apply node-level OOD perturbation.
 
-    First, select anomalous nodes with Bernoulli(node_ratio). For every selected
+    First, select anomalous nodes with Bernoulli(Pood). For every selected
     node, all its original incident edges are removed. Then new neighbors are
-    sampled with Bernoulli(rewire_ratio) from non-self, non-original-neighbor
+    sampled with Bernoulli(Pcr) from non-self, non-original-neighbor
     candidates and used to reconnect the selected node.
     """
-    if not (0.0 <= node_ratio <= 1.0):
-        raise ValueError(f'node_ratio must be in [0, 1], got {node_ratio}')
-    if not (0.0 <= rewire_ratio <= 1.0):
-        raise ValueError(f'rewire_ratio must be in [0, 1], got {rewire_ratio}')
+    if not (0.0 <= Pood <= 1.0):
+        raise ValueError(f'Pood must be in [0, 1], got {Pood}')
+    if not (0.0 <= Pcr <= 1.0):
+        raise ValueError(f'Pcr must be in [0, 1], got {Pcr}')
 
     edge_index = data.edge_index
     device = edge_index.device
@@ -91,7 +91,7 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
     num_undirected_edges = u.numel()
 
     node_candidates = torch.arange(num_nodes, device=device)
-    select_mask = torch.rand(node_candidates.numel(), generator=generator, device=device) < node_ratio
+    select_mask = torch.rand(node_candidates.numel(), generator=generator, device=device) < Pood
     selected_nodes = node_candidates[select_mask]
     selected_nodes_cpu = selected_nodes.cpu()
 
@@ -153,7 +153,7 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
             added_per_node[node] = 0
             continue
 
-        if rewire_ratio <= 0.0:
+        if Pcr <= 0.0:
             added_per_node[node] = 0
             continue
 
@@ -166,7 +166,7 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
             added_per_node[node] = 0
             continue
 
-        sampled_mask = torch.rand(candidates.numel(), generator=generator, device=device) < rewire_ratio
+        sampled_mask = torch.rand(candidates.numel(), generator=generator, device=device) < Pcr
         new_neighbors = candidates[sampled_mask]
         if new_neighbors.numel() == 0:
             added_per_node[node] = 0
