@@ -9,18 +9,18 @@ from torch_geometric.utils import coalesce, remove_self_loops, scatter, to_undir
 from .models import GNN_PyG
 
 
-def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
-    """Apply OOD perturbation (fast tensorized implementation).
+def apply_ood_perturbation(data, Pood, Pcr, seed):
+    """Apply node-level OOD perturbation.
 
-    The perturbation rewires only edges incident to selected nodes, aiming for
-    per-node remove-k/add-k balance (degree approximately preserved). The
-    output graph is intended for training-time edge augmentation; node features
-    are kept unchanged and edge_attr is intentionally dropped.
+    First, select anomalous nodes with Bernoulli(Pood). For every selected
+    node, all its original incident edges are removed. Then new neighbors are
+    sampled with Bernoulli(Pcr) from non-self, non-original-neighbor
+    candidates and used to reconnect the selected node.
     """
-    if not (0.0 <= node_ratio <= 1.0):
-        raise ValueError(f'node_ratio must be in [0, 1], got {node_ratio}')
-    if not (0.0 <= rewire_ratio <= 1.0):
-        raise ValueError(f'rewire_ratio must be in [0, 1], got {rewire_ratio}')
+    if not (0.0 <= Pood <= 1.0):
+        raise ValueError(f'Pood must be in [0, 1], got {Pood}')
+    if not (0.0 <= Pcr <= 1.0):
+        raise ValueError(f'Pcr must be in [0, 1], got {Pcr}')
 
     edge_index = data.edge_index
     device = edge_index.device
@@ -36,6 +36,10 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
             'num_edges_after': int(edge_index.size(1)),
             'rewired_edges': 0,
             'max_rewired_per_node': 0,
+            'broken_edges': 0,
+            'added_edges': 0,
+            'max_broken_per_node': 0,
+            'max_added_per_node': 0,
             'mean_degree_before': 0.0,
             'mean_degree_after': 0.0,
             'degree_change': {},
@@ -65,6 +69,10 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
             'num_edges_after': int(edge_index.size(1)),
             'rewired_edges': 0,
             'max_rewired_per_node': 0,
+            'broken_edges': 0,
+            'added_edges': 0,
+            'max_broken_per_node': 0,
+            'max_added_per_node': 0,
             'mean_degree_before': 0.0,
             'mean_degree_after': 0.0,
             'degree_change': {},
@@ -83,7 +91,7 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
     num_undirected_edges = u.numel()
 
     node_candidates = torch.arange(num_nodes, device=device)
-    select_mask = torch.rand(node_candidates.numel(), generator=generator, device=device) < node_ratio
+    select_mask = torch.rand(node_candidates.numel(), generator=generator, device=device) < Pood
     selected_nodes = node_candidates[select_mask]
     selected_nodes_cpu = selected_nodes.cpu()
 
@@ -101,6 +109,10 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
             'num_edges_after': int(edge_index_ood.size(1)),
             'rewired_edges': 0,
             'max_rewired_per_node': 0,
+            'broken_edges': 0,
+            'added_edges': 0,
+            'max_broken_per_node': 0,
+            'max_added_per_node': 0,
             'mean_degree_before': 0.0,
             'mean_degree_after': 0.0,
             'degree_change': {},
@@ -124,23 +136,25 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
     remove_edge_ids = []
     add_u_list = []
     add_v_list = []
-    rewired_per_node = {}
-    available_for_removal = torch.ones(num_undirected_edges, dtype=torch.bool, device=device)
+    broken_per_node = {}
+    added_per_node = {}
 
     selected_nodes_list = selected_nodes.tolist()
     selected_starts = torch.searchsorted(inc_nodes_sorted, selected_nodes, right=False).tolist()
     selected_ends = torch.searchsorted(inc_nodes_sorted, selected_nodes, right=True).tolist()
     for node, start, end in zip(selected_nodes_list, selected_starts, selected_ends):
         incident_ids = inc_edge_ids_sorted[start:end]
-        incident_ids = incident_ids[available_for_removal[incident_ids]]
         degree = int(incident_ids.numel())
+        broken_per_node[node] = degree
+        if degree > 0:
+            remove_edge_ids.append(incident_ids)
+
         if degree == 0:
-            rewired_per_node[node] = 0
+            added_per_node[node] = 0
             continue
 
-        k = min(int(rewire_ratio * degree), degree)
-        if k <= 0:
-            rewired_per_node[node] = 0
+        if Pcr <= 0.0:
+            added_per_node[node] = 0
             continue
 
         neighbors = torch.where(u[incident_ids] == node, v[incident_ids], u[incident_ids])
@@ -148,34 +162,30 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
         candidate_mask[node] = False
         candidate_mask[neighbors] = False
         candidates = candidate_mask.nonzero(as_tuple=False).squeeze(1)
-
-        # Effective rewiring count after enforcing unique/non-self candidates.
-        effective_k = min(k, int(candidates.numel()))
-        if effective_k <= 0:
-            rewired_per_node[node] = 0
+        if candidates.numel() == 0:
+            added_per_node[node] = 0
             continue
 
-        rm_perm = torch.randperm(degree, generator=generator, device=device)[:effective_k]
-        rm_ids = incident_ids[rm_perm]
-        cand_perm = torch.randperm(candidates.numel(), generator=generator, device=device)[:effective_k]
-        new_neighbors = candidates[cand_perm]
+        sampled_mask = torch.rand(candidates.numel(), generator=generator, device=device) < Pcr
+        new_neighbors = candidates[sampled_mask]
+        if new_neighbors.numel() == 0:
+            added_per_node[node] = 0
+            continue
 
-        node_vec = torch.full((effective_k,), node, dtype=torch.long, device=device)
+        node_vec = torch.full((new_neighbors.numel(),), node, dtype=torch.long, device=device)
         add_u = torch.minimum(node_vec, new_neighbors)
         add_v = torch.maximum(node_vec, new_neighbors)
 
-        remove_edge_ids.append(rm_ids)
         add_u_list.append(add_u)
         add_v_list.append(add_v)
-        rewired_per_node[node] = effective_k
-        available_for_removal[rm_ids] = False
+        added_per_node[node] = int(new_neighbors.numel())
 
     keep_mask = torch.ones(num_undirected_edges, dtype=torch.bool, device=device)
-    total_rewired = 0
+    total_broken = 0
     if remove_edge_ids:
         remove_ids = torch.unique(torch.cat(remove_edge_ids, dim=0))
         keep_mask[remove_ids] = False
-        total_rewired = int(remove_ids.numel())
+        total_broken = int(remove_ids.numel())
 
     if add_u_list:
         add_u = torch.cat(add_u_list, dim=0)
@@ -221,8 +231,14 @@ def apply_ood_perturbation(data, node_ratio, rewire_ratio, seed):
         'selected_ratio': float(selected_nodes.numel() / num_nodes),
         'num_edges_before': int(edge_index.size(1)),
         'num_edges_after': int(edge_index_ood.size(1)),
-        'rewired_edges': int(total_rewired),
-        'max_rewired_per_node': int(max(rewired_per_node.values(), default=0)),
+        # Backward-compatible fields:
+        'rewired_edges': int(total_broken),
+        'max_rewired_per_node': int(max(broken_per_node.values(), default=0)),
+        # Node-level disconnect/reconnect stats:
+        'broken_edges': int(total_broken),
+        'added_edges': int(sum(added_per_node.values())),
+        'max_broken_per_node': int(max(broken_per_node.values(), default=0)),
+        'max_added_per_node': int(max(added_per_node.values(), default=0)),
         'mean_degree_before': mean_before,
         'mean_degree_after': mean_after,
         'degree_change': degree_change,
