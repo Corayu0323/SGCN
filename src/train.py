@@ -29,6 +29,81 @@ _SGCN_RANDOM_WALK_MAX_HOPS = 10
 _SGCN_MIN_TRAIN_NODES = 32
 # Number of validation nodes sampled for the per-subgraph quality score
 _SGCN_VAL_SAMPLE_SIZE = 512
+_FISHER_EPS = 1e-8
+
+
+def compute_fisher_trace(model, dataloader):
+    """Return empirical Fisher trace from cached grad-squared statistics.
+
+    Each element in *dataloader* can be:
+      - dict with keys ``grad_sq_sum`` and ``num_samples`` (preferred, no extra backward),
+      - tuple/list ``(grad_sq_sum, num_samples)``,
+      - scalar num_samples (uses current ``model.parameters()`` gradients).
+    """
+    grad_sq_sum = 0.0
+    num_samples = 0
+
+    for batch in dataloader:
+        if isinstance(batch, dict):
+            if 'grad_sq_sum' not in batch or 'num_samples' not in batch:
+                raise ValueError("batch dict must contain 'grad_sq_sum' and 'num_samples'")
+            grad_sq_sum += float(batch['grad_sq_sum'])
+            num_samples += int(batch['num_samples'])
+            continue
+
+        if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+            grad_sq_sum += float(batch[0])
+            num_samples += int(batch[1])
+            continue
+
+        # Fallback: use gradients currently on the model.
+        if not isinstance(batch, (int, float)):
+            raise TypeError("scalar fallback for compute_fisher_trace expects int/float num_samples")
+        for param in model.parameters():
+            if param.grad is not None:
+                grad_sq_sum += float(param.grad.detach().pow(2).sum().item())
+        num_samples += int(batch)
+
+    return grad_sq_sum / max(float(num_samples), _FISHER_EPS)
+
+
+def aggregate_with_fisher_trace(all_models, all_traces):
+    """Aggregate model parameters with Fisher-trace weights."""
+    if not all_models:
+        raise ValueError("all_models must be non-empty")
+    if len(all_models) != len(all_traces):
+        raise ValueError("all_models and all_traces must have the same length")
+
+    states = []
+    for model_or_state in all_models:
+        if hasattr(model_or_state, 'state_dict'):
+            states.append(model_or_state.state_dict())
+        elif isinstance(model_or_state, dict):
+            states.append(model_or_state)
+        else:
+            raise TypeError(
+                "all_models items must be nn.Module instances or state_dict dictionaries"
+            )
+    ref_state = states[0]
+    device = next(iter(ref_state.values())).device
+    traces = torch.as_tensor(all_traces, dtype=torch.float, device=device)
+    traces = torch.clamp(traces, min=0.0) + _FISHER_EPS
+    weights = traces / traces.sum()
+
+    best_idx = None
+    agg_state = {}
+    for key in ref_state:
+        tensors = [state[key].to(device) for state in states]
+        ref_tensor = tensors[0]
+        if torch.is_floating_point(ref_tensor):
+            stacked = torch.stack([t.float() for t in tensors], dim=0)
+            w = weights.view([-1] + [1] * (stacked.dim() - 1))
+            agg_state[key] = (stacked * w).sum(dim=0).to(dtype=ref_tensor.dtype)
+        else:
+            if best_idx is None:
+                best_idx = int(torch.argmax(weights).item())
+            agg_state[key] = tensors[best_idx].clone()
+    return agg_state
 
 def _sample_subgraph_nodes(edge_index, n_nodes, train_idx, method, n_sample,
                            subgraph_max_nodes=None, unsampled_nodes=None):
@@ -203,13 +278,14 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
        Clear optimizer momentum so subgraphs do not share gradient state.
     4. Run *local_epochs* gradient steps on the fixed subgraph data (no
        re-sampling between local steps).
-    5. Evaluate the resulting local model on a mini-batch of validation nodes
-       (via a forward pass over the subgraph augmented with those val nodes).
-    6. Record the local state dict and validation loss (as quality score).
+    5. Compute a subgraph quality score:
+       - 'fisher': empirical Fisher trace on training gradients (no extra backward),
+       - others : validation-loss-based score on sampled val nodes.
+    6. Record the local state dict and subgraph score.
 
     After all subgraphs are processed:
 
-    * Discard the bottom *truncation_ratio* fraction by validation score
+    * Discard the bottom *truncation_ratio* fraction by subgraph score
       (truncation mechanism – suppresses noise-dominated subgraphs).
     * Aggregate the remaining local states according to *aggregation_method*.
     * Load the aggregated state into the model and clear stale optimizer
@@ -229,7 +305,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     This function records per-subgraph timings:
       subgraph_sampling_time_r : time to sample and build the subgraph.
       subgraph_train_time_r    : time to run *local_epochs* gradient steps.
-      subgraph_eval_time_r     : time for the validation scoring forward pass.
+      subgraph_eval_time_r     : time for subgraph scoring.
       subgraph_total_time_r    = sampling + train + eval for subgraph r.
 
     The returned epoch time uses the **parallel-pipeline** convention:
@@ -269,6 +345,8 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
                                    'weighted' – performance-based linear-
                                                 normalized weighted average
                                                 (SGCN-Weighted).
+                                   'fisher'   – Fisher-trace weighted average
+                                                using training gradients only.
     debug_subgraph_stats : bool – when True, print per-subgraph shape and
                                    CUDA memory stats before each forward pass.
     min_subgraph_nodes  : int  – if > 0, pad sampled subgraph to this many
@@ -313,7 +391,12 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
 
     # Move split indices to device so all isin/randperm ops stay on GPU.
     train_idx_dev = train_idx.to(device)
-    val_idx_dev   = val_idx.to(device)
+    if aggregation_method == 'fisher':
+        val_idx_dev = train_idx_dev
+    else:
+        if val_idx is None:
+            raise ValueError("val_idx must be provided when aggregation_method is not 'fisher'")
+        val_idx_dev = val_idx.to(device)
 
     n_nodes       = data.num_nodes
     # subgraph_max_nodes takes priority; fall back to ratio-based size.
@@ -483,12 +566,21 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         train_mask_dev = train_mask
         last_loss      = 0.0
 
+        grad_sq_sum_local = 0.0
+        num_samples_local = 0
+        train_nodes_this_subgraph = int(train_mask_dev.sum().item())
         for _le in range(local_epochs):
             pred = model(x_sub, ei_sub, ea_sub)
             loss = criterion(pred[train_mask_dev], y_sub[train_mask_dev].float())
 
             optimizer.zero_grad()
             loss.backward()
+            grad_sq_sum_local += sum(
+                float(param.grad.detach().pow(2).sum().item())
+                for param in model.parameters()
+                if param.grad is not None
+            )
+            num_samples_local += train_nodes_this_subgraph
             optimizer.step()
 
             last_loss = loss.item()
@@ -505,65 +597,71 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
-        # ── 5. Quick validation score ────────────────────────────────────────
+        # ── 5. Subgraph quality score ────────────────────────────────────────
         _cuda_sync(device)
         t_eval_start = time.time()
 
-        model.eval()
-        with torch.no_grad():
-            val_sample  = val_idx_dev[
-                torch.randperm(len(val_idx_dev), device=device)[:val_sample_size]
-            ]
-            # Augment subgraph with val nodes so GCN can aggregate their
-            # neighborhood context without leaking their labels.
-            eval_node_idx = torch.cat([node_idx, val_sample]).unique()
-            eval_node_idx = eval_node_idx.sort().values
-
-            # Build eval subgraph on GPU – same approach as training subgraph.
-            in_eval_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
-            in_eval_mask[eval_node_idx] = True
-            edge_keep_eval = in_eval_mask[edge_index_eval_dev[0]] & in_eval_mask[edge_index_eval_dev[1]]
-            del in_eval_mask
-            ei_eval_global = edge_index_eval_dev[:, edge_keep_eval]
-            ea_eval = edge_attr_eval_dev[edge_keep_eval] if edge_attr_eval_dev is not None else None
-
-            # Apply the same edge cap to the eval subgraph.
-            if max_subgraph_edges is not None and max_subgraph_edges > 0:
-                n_edges_eval = ei_eval_global.size(1)
-                if n_edges_eval > max_subgraph_edges:
-                    perm_eval      = torch.randperm(n_edges_eval, device=device)[:max_subgraph_edges]
-                    ei_eval_global = ei_eval_global[:, perm_eval]
-                    if ea_eval is not None:
-                        ea_eval = ea_eval[perm_eval]
-
-            # Relabel to contiguous local ids (GPU).
-            g2l_eval = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
-            g2l_eval[eval_node_idx] = torch.arange(len(eval_node_idx), device=device)
-            ei_eval = g2l_eval[ei_eval_global]
-            del g2l_eval
-            del ei_eval_global
-
-            x_eval  = x_full_dev[eval_node_idx]
-            y_eval  = y_full_dev[eval_node_idx]
-
-            if use_labels:
-                eval_train_mask = torch.isin(eval_node_idx, train_idx_dev)
-                non_train_eval  = torch.where(~eval_train_mask)[0]
-                x_eval = add_labels(
-                    x_eval, data.train_labels_onehot,
-                    non_train_eval.cpu(), n_classes, device
-                )
-
-            pred_eval      = model(x_eval, ei_eval, ea_eval)
-            # val_sample and eval_node_idx are both on device; no .to(device) needed.
-            val_local_mask = torch.isin(eval_node_idx, val_sample)
-            val_loss = criterion(
-                pred_eval[val_local_mask], y_eval[val_local_mask].float()
+        if aggregation_method == 'fisher':
+            fisher_trace = compute_fisher_trace(
+                model, [{'grad_sq_sum': grad_sq_sum_local, 'num_samples': num_samples_local}]
             )
-            val_score = -val_loss.item()   # higher is better
+            val_score = fisher_trace
+        else:
+            model.eval()
+            with torch.no_grad():
+                val_sample  = val_idx_dev[
+                    torch.randperm(len(val_idx_dev), device=device)[:val_sample_size]
+                ]
+                # Augment subgraph with val nodes so GCN can aggregate their
+                # neighborhood context without leaking their labels.
+                eval_node_idx = torch.cat([node_idx, val_sample]).unique()
+                eval_node_idx = eval_node_idx.sort().values
 
-            del pred_eval, val_loss, val_local_mask
-            del x_eval, y_eval, ei_eval, ea_eval
+                # Build eval subgraph on GPU – same approach as training subgraph.
+                in_eval_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+                in_eval_mask[eval_node_idx] = True
+                edge_keep_eval = in_eval_mask[edge_index_eval_dev[0]] & in_eval_mask[edge_index_eval_dev[1]]
+                del in_eval_mask
+                ei_eval_global = edge_index_eval_dev[:, edge_keep_eval]
+                ea_eval = edge_attr_eval_dev[edge_keep_eval] if edge_attr_eval_dev is not None else None
+
+                # Apply the same edge cap to the eval subgraph.
+                if max_subgraph_edges is not None and max_subgraph_edges > 0:
+                    n_edges_eval = ei_eval_global.size(1)
+                    if n_edges_eval > max_subgraph_edges:
+                        perm_eval      = torch.randperm(n_edges_eval, device=device)[:max_subgraph_edges]
+                        ei_eval_global = ei_eval_global[:, perm_eval]
+                        if ea_eval is not None:
+                            ea_eval = ea_eval[perm_eval]
+
+                # Relabel to contiguous local ids (GPU).
+                g2l_eval = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
+                g2l_eval[eval_node_idx] = torch.arange(len(eval_node_idx), device=device)
+                ei_eval = g2l_eval[ei_eval_global]
+                del g2l_eval
+                del ei_eval_global
+
+                x_eval  = x_full_dev[eval_node_idx]
+                y_eval  = y_full_dev[eval_node_idx]
+
+                if use_labels:
+                    eval_train_mask = torch.isin(eval_node_idx, train_idx_dev)
+                    non_train_eval  = torch.where(~eval_train_mask)[0]
+                    x_eval = add_labels(
+                        x_eval, data.train_labels_onehot,
+                        non_train_eval.cpu(), n_classes, device
+                    )
+
+                pred_eval      = model(x_eval, ei_eval, ea_eval)
+                # val_sample and eval_node_idx are both on device; no .to(device) needed.
+                val_local_mask = torch.isin(eval_node_idx, val_sample)
+                val_loss = criterion(
+                    pred_eval[val_local_mask], y_eval[val_local_mask].float()
+                )
+                val_score = -val_loss.item()   # higher is better
+
+                del pred_eval, val_loss, val_local_mask
+                del x_eval, y_eval, ei_eval, ea_eval
 
         _cuda_sync(device)
         subgraph_eval_times.append(time.time() - t_eval_start)
@@ -630,23 +728,29 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
         # normalize so weights sum to 1.
         shifted = kept_scores - kept_scores.min() + 1e-8
         weights = shifted / shifted.sum()
+    elif aggregation_method == 'fisher':
+        agg_state = aggregate_with_fisher_trace(
+            [local_states[i] for i in kept_idx],
+            [val_scores[i] for i in kept_idx],
+        )
     else:
         # Default 'sgcn': softmax-weighted average over validation scores
         if aggregation_method != 'sgcn':
             raise ValueError(
                 f"Unknown aggregation_method: {aggregation_method!r}. "
-                f"Choose from: 'sgcn', 'avg', 'weighted'."
+                f"Choose from: 'sgcn', 'avg', 'weighted', 'fisher'."
             )
         weights = torch.softmax(kept_scores, dim=0)
 
-    agg_state = {}
-    for key in epoch_init_state:
-        # local_states entries are GPU tensors; stacking stays on device.
-        stacked = torch.stack(
-            [local_states[i][key].float() for i in kept_idx], dim=0
-        )
-        w           = weights.view([-1] + [1] * (stacked.dim() - 1))
-        agg_state[key] = (stacked * w).sum(dim=0).to(epoch_init_state[key].dtype)
+    if aggregation_method != 'fisher':
+        agg_state = {}
+        for key in epoch_init_state:
+            # local_states entries are GPU tensors; stacking stays on device.
+            stacked = torch.stack(
+                [local_states[i][key].float() for i in kept_idx], dim=0
+            )
+            w           = weights.view([-1] + [1] * (stacked.dim() - 1))
+            agg_state[key] = (stacked * w).sum(dim=0).to(epoch_init_state[key].dtype)
 
     # ── 8. Load aggregated state; clear stale optimiser momentum ────────────
     # agg_state tensors are already on device; no .to(device) map needed.
