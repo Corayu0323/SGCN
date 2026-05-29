@@ -92,6 +92,8 @@ def update_experiment_index(exp_dir, config, agg_stats, results_dir='results'):
         'method':             config.get('method', 'N/A'),
         'dataset':            config.get('dataset', 'N/A'),
         'sampling_method':    config.get('sampling_method', 'N/A'),
+        'pood':               config.get('pood', config.get('Pood', float('nan'))),
+        'pcr':                config.get('pcr', config.get('Pcr', float('nan'))),
         'trunc_ratio':        config.get('trunc_ratio', float('nan')),
         'local_epochs':       config.get('local_epochs', float('nan')),
         'mean_best_test_auc': agg_stats.get('mean_best_test_auc', float('nan')),
