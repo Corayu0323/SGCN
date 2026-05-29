@@ -1,9 +1,10 @@
-import argparse
-import glob
-from pathlib import Path
+from __future__ import annotations
 
-import pandas as pd
-import torch
+import argparse
+import csv
+import glob
+import gzip
+from pathlib import Path
 
 
 def _default_project_root() -> Path:
@@ -33,6 +34,8 @@ def _find_latest_prediction() -> Path | None:
 
 
 def _load_tensor(path: str | Path, key: str | None = None) -> torch.Tensor:
+    import torch
+
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix not in {".pt", ".pth"}:
@@ -72,38 +75,55 @@ def _load_label_mapping(path: Path) -> dict[int, str]:
             "Expected ogbn-proteins mapping file 'labelidx2GO.csv.gz'."
         )
 
-    df = pd.read_csv(path, compression="infer")
-    if df.empty:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+
+    if not rows:
         return {}
 
-    columns = list(df.columns)
+    header = rows[0]
+    data_rows = rows[1:]
+    used_named_header = False
 
     idx_col = None
     go_col = None
-    for c in columns:
-        lc = c.lower()
+    for i, c in enumerate(header):
+        lc = c.strip().lower()
         if idx_col is None and ("idx" in lc or lc == "label"):
-            idx_col = c
+            idx_col = i
+            used_named_header = True
         if go_col is None and "go" in lc:
-            go_col = c
+            go_col = i
+            used_named_header = True
 
-    if idx_col is None and len(columns) >= 1:
-        idx_col = columns[0]
-    if go_col is None and len(columns) >= 2:
-        go_col = columns[1]
+    if idx_col is None:
+        idx_col = 0 if len(header) >= 1 else None
+    if go_col is None:
+        go_col = 1 if len(header) >= 2 else None
 
     if idx_col is None or go_col is None:
         raise ValueError(
-            f"Cannot parse label mapping columns from {path}. Found columns: {columns}"
+            f"Cannot parse label mapping columns from {path}. Header: {header}"
         )
+    if not used_named_header:
+        data_rows = rows
 
     mapping = {}
-    for _, row in df[[idx_col, go_col]].dropna().iterrows():
-        mapping[int(row[idx_col])] = str(row[go_col])
+    for row in data_rows:
+        if len(row) <= max(idx_col, go_col):
+            continue
+        idx_raw = row[idx_col].strip()
+        go_raw = row[go_col].strip()
+        if not idx_raw or not go_raw:
+            continue
+        mapping[int(idx_raw)] = go_raw
     return mapping
 
 
 def _load_split_and_labels(split: str) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch
+
     try:
         from ogb.nodeproppred import PygNodePropPredDataset
     except ImportError as exc:
@@ -185,6 +205,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _topk_label_counts(mask: torch.Tensor, k: int) -> list[tuple[int, int]]:
+    import torch
+
     counts = mask.sum(dim=0).to(torch.long)
     if counts.numel() == 0 or counts.max().item() == 0:
         return []
@@ -207,6 +229,8 @@ def _write_detail_file(
     label_mapping: dict[int, str],
     max_items: int,
 ) -> tuple[int, bool]:
+    import torch
+
     fp_pos = torch.nonzero(fp_mask, as_tuple=False)
     fn_pos = torch.nonzero(fn_mask, as_tuple=False)
     total_items = fp_pos.size(0) + fn_pos.size(0)
@@ -241,6 +265,7 @@ def _write_detail_file(
 def main(argv=None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+    import torch
 
     if args.threshold < 0 or args.threshold > 1:
         raise ValueError("--threshold must be in [0, 1].")
