@@ -1071,15 +1071,18 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         data_train.test_mask = torch.zeros(data_train.num_nodes, dtype=torch.bool)
         data_train.test_mask[test_idx] = True
 
-        # GraphSAINT: sample random-walk-induced subgraphs instead of
-        # per-node neighborhoods.  num_steps mirrors the ~10 batches/epoch
-        # produced by NeighborLoader, and walk_length provides a 2-hop reach.
-        saint_num_steps = max(len(train_idx) // train_batch_size, 1)
+        # GraphSAINT: use denser random-walk coverage, aligned with GraphSAINT
+        # OGB recipes that rely on larger coverage and normalisation sampling.
+        saint_batch_size = max(1, min(len(train_idx), max(len(train_idx) // 20, 4096)))
+        saint_walk_length = 3
+        saint_base_steps = max(math.ceil(len(train_idx) / saint_batch_size), 1)
+        saint_num_steps = min(max(saint_base_steps * 4, 20), 200)
         train_loader = GraphSAINTRandomWalkSampler(
             data_train,
-            batch_size=train_batch_size,
-            walk_length=2,
+            batch_size=saint_batch_size,
+            walk_length=saint_walk_length,
             num_steps=saint_num_steps,
+            sample_coverage=100,
             num_workers=4,
         )
     elif mpnn == 'sgcn':
