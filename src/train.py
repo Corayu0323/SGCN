@@ -798,22 +798,27 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
                 use_labels=False, n_classes=112):
     model.train()
     loss_sum, total = 0, 0
-    sampling_time   = 0.0
+    fetch_time    = 0.0
+    h2d_time      = 0.0
+    compute_time  = 0.0
 
-    _cuda_sync(device)
-    epoch_start = time.time()
-
-    # Manual iterator is used to time each batch fetch (sampling_time) separately
-    # from the forward/backward pass without restructuring the training loop.
+    # Manual iterator is used so timing can be split into:
+    # fetch_time (next), h2d_time (batch.to), and compute_time (fwd/bwd/step).
     loader_iter = iter(dataloader)
     for _ in range(len(dataloader)):
-        t_sample = time.time()
+        t_fetch = time.time()
         batch = next(loader_iter)
-        sampling_time += time.time() - t_sample
+        fetch_time += time.time() - t_fetch
 
+        _cuda_sync(device)
+        t_h2d = time.time()
         batch      = batch.to(device)
+        _cuda_sync(device)
+        h2d_time += time.time() - t_h2d
         batch_size = batch.batch_size
 
+        _cuda_sync(device)
+        t_compute = time.time()
         if use_labels:
             non_seed_idx = torch.arange(batch_size, batch.x.shape[0], device=device)
             x = add_labels(batch.x, batch.train_labels_onehot, non_seed_idx, n_classes, device)
@@ -826,14 +831,16 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        _cuda_sync(device)
+        compute_time += time.time() - t_compute
 
         loss_sum += loss.item() * batch_size
         total    += batch_size
 
-    _cuda_sync(device)
-    epoch_time = time.time() - epoch_start
+    epoch_time    = compute_time
+    sampling_time = fetch_time + h2d_time
 
-    return loss_sum / total, epoch_time, sampling_time
+    return loss_sum / total, epoch_time, sampling_time, fetch_time, h2d_time
 
 
 def train_epoch_fullbatch(model, x, edge_index, y, edge_attr, train_idx,
@@ -914,26 +921,33 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
     When the batch carries ``batch.node_norm`` (sampling normalisation
     weights produced by the GraphSAINT sampler), each per-node loss term is
     scaled by the corresponding weight before summing.
+
+    Returns compute-only epoch_time; train_sampling_time holds fetch+h2d time.
     """
     model.train()
     loss_sum, total = 0, 0
-    sampling_time   = 0.0
-
-    _cuda_sync(device)
-    epoch_start = time.time()
+    fetch_time      = 0.0
+    h2d_time        = 0.0
+    compute_time    = 0.0
 
     loader_iter = iter(dataloader)
     for _ in range(len(dataloader)):
-        t_sample = time.time()
+        t_fetch = time.time()
         batch = next(loader_iter)
-        sampling_time += time.time() - t_sample
+        fetch_time += time.time() - t_fetch
 
+        _cuda_sync(device)
+        t_h2d = time.time()
         batch = batch.to(device)
+        _cuda_sync(device)
+        h2d_time += time.time() - t_h2d
 
         train_mask = batch.train_mask
         if train_mask.sum() == 0:
             continue
 
+        _cuda_sync(device)
+        t_compute = time.time()
         if use_labels:
             # Reveal labels for non-training nodes only (same convention as
             # train_epoch, where seed-node labels are withheld).
@@ -957,6 +971,8 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        _cuda_sync(device)
+        compute_time += time.time() - t_compute
 
         n_train_in_batch = train_mask.sum().item()
         # node_norm path: loss is already a weighted sum; add directly.
@@ -968,10 +984,10 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
             loss_sum += loss.item() * n_train_in_batch
         total    += n_train_in_batch
 
-    _cuda_sync(device)
-    epoch_time = time.time() - epoch_start
+    epoch_time    = compute_time
+    sampling_time = fetch_time + h2d_time
 
-    return (loss_sum / total if total > 0 else 0.0), epoch_time, sampling_time
+    return (loss_sum / total if total > 0 else 0.0), epoch_time, sampling_time, fetch_time, h2d_time
 
 
 @torch.no_grad()
@@ -1144,11 +1160,16 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     run_start = time.time()
 
     for epoch in range(1, n_epochs + 1):
+        loader_timing = None
         if mpnn == 'graphsaint':
-            loss, epoch_time, sampling_time = train_epoch_saint(
+            loss, epoch_time, sampling_time, fetch_time, h2d_time = train_epoch_saint(
                 model, train_loader, criterion, optimizer, device,
                 train_idx, use_labels, n_classes
             )
+            loader_timing = {
+                'train_fetch_time': fetch_time,
+                'train_h2d_time': h2d_time,
+            }
         elif mpnn == 'sgcn':
             loss, epoch_time, sampling_time, extra_sgcn = train_epoch_sgcn(
                 model, data, criterion, optimizer, device,
@@ -1179,9 +1200,13 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 train_labels_onehot=data_train.train_labels_onehot,
             )
         else:
-            loss, epoch_time, sampling_time = train_epoch(
+            loss, epoch_time, sampling_time, fetch_time, h2d_time = train_epoch(
                 model, train_loader, criterion, optimizer, device, use_labels, n_classes
             )
+            loader_timing = {
+                'train_fetch_time': fetch_time,
+                'train_h2d_time': h2d_time,
+            }
 
         record = {
             'epoch':               epoch,
@@ -1192,6 +1217,8 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             'train_epoch_time':    epoch_time,
             'eval_time':           float('nan'),
         }
+        if loader_timing is not None:
+            record.update(loader_timing)
 
         # For SGCN, add detailed timing fields from the parallel-pipeline model.
         # epoch_time already holds sgcn_epoch_time_max for SGCN.
@@ -1201,6 +1228,7 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
                 'max_subgraph_pipeline_time': extra_sgcn['max_subgraph_pipeline_time'],
                 'aggregation_time':           extra_sgcn['aggregation_time'],
                 'sgcn_epoch_time_max':        epoch_time,
+                'train_epoch_time_parallel_max': epoch_time,
                 'subgraph_sampling_times':    extra_sgcn['subgraph_sampling_times'],
                 'subgraph_train_times':       extra_sgcn['subgraph_train_times'],
                 'subgraph_eval_times':        extra_sgcn['subgraph_eval_times'],

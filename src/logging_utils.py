@@ -131,6 +131,8 @@ def build_run_record(method, run_id, seed, result):
                       if not np.isnan(r['eval_time'])]
     epoch_times    = [r['train_epoch_time']    for r in epoch_records]
     sampling_times = [r['train_sampling_time'] for r in epoch_records]
+    fetch_times    = [r.get('train_fetch_time', np.nan) for r in epoch_records]
+    h2d_times      = [r.get('train_h2d_time', np.nan)   for r in epoch_records]
 
     record = {
         'method':                  method,
@@ -145,6 +147,10 @@ def build_run_record(method, run_id, seed, result):
         'mean_eval_time':          np.mean(eval_times) if eval_times else float('nan'),
         'total_run_time':          result['total_run_time'],
     }
+    if not np.all(np.isnan(fetch_times)):
+        record['mean_train_fetch_time'] = np.nanmean(fetch_times)
+    if not np.all(np.isnan(h2d_times)):
+        record['mean_train_h2d_time'] = np.nanmean(h2d_times)
 
     # For SGCN, include parallel-pipeline timing summary fields.
     if method == 'sgcn' and epoch_records and 'sgcn_epoch_time_max' in epoch_records[0]:
@@ -199,6 +205,16 @@ def compute_aggregate(run_records):
         'mean_total_run_time':    df['total_run_time'].mean(),
         'std_total_run_time':     df['total_run_time'].std(ddof=1),
     }
+    if 'mean_train_fetch_time' in df.columns:
+        agg.update({
+            'mean_train_fetch_time': df['mean_train_fetch_time'].mean(),
+            'std_train_fetch_time':  df['mean_train_fetch_time'].std(ddof=1),
+        })
+    if 'mean_train_h2d_time' in df.columns:
+        agg.update({
+            'mean_train_h2d_time': df['mean_train_h2d_time'].mean(),
+            'std_train_h2d_time':  df['mean_train_h2d_time'].std(ddof=1),
+        })
     # For SGCN runs include parallel-pipeline timing aggregates.
     if 'mean_sgcn_epoch_time_max' in df.columns:
         agg.update({
