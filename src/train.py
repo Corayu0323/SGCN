@@ -837,6 +837,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device,
         loss_sum += loss.item() * batch_size
         total    += batch_size
 
+    # Keep the return variable name for API compatibility. Its value is
+    # compute-only time on loader-based training paths.
     epoch_time    = compute_time
     sampling_time = fetch_time + h2d_time
 
@@ -984,6 +986,8 @@ def train_epoch_saint(model, dataloader, criterion, optimizer, device,
             loss_sum += loss.item() * n_train_in_batch
         total    += n_train_in_batch
 
+    # Keep the return variable name for API compatibility. Its value is
+    # compute-only time on loader-based training paths.
     epoch_time    = compute_time
     sampling_time = fetch_time + h2d_time
 
@@ -1160,16 +1164,17 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     run_start = time.time()
 
     for epoch in range(1, n_epochs + 1):
-        loader_timing = None
+        loader_timing = {}
         if mpnn == 'graphsaint':
             loss, epoch_time, sampling_time, fetch_time, h2d_time = train_epoch_saint(
                 model, train_loader, criterion, optimizer, device,
                 train_idx, use_labels, n_classes
             )
-            loader_timing = {
+            loader_timing.update({
                 'train_fetch_time': fetch_time,
                 'train_h2d_time': h2d_time,
-            }
+                'train_epoch_wall_time': epoch_time + sampling_time,
+            })
         elif mpnn == 'sgcn':
             loss, epoch_time, sampling_time, extra_sgcn = train_epoch_sgcn(
                 model, data, criterion, optimizer, device,
@@ -1203,10 +1208,11 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             loss, epoch_time, sampling_time, fetch_time, h2d_time = train_epoch(
                 model, train_loader, criterion, optimizer, device, use_labels, n_classes
             )
-            loader_timing = {
+            loader_timing.update({
                 'train_fetch_time': fetch_time,
                 'train_h2d_time': h2d_time,
-            }
+                'train_epoch_wall_time': epoch_time + sampling_time,
+            })
 
         record = {
             'epoch':               epoch,
@@ -1214,10 +1220,16 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
             'val_auc':             float('nan'),
             'test_auc':            float('nan'),
             'train_sampling_time': sampling_time,
+            # NOTE: For loader-based methods (GraphSAGE/GraphSAINT), this is
+            # compute-only time. train_epoch_wall_time matches the pre-change
+            # wall-time semantics (compute + sampling).
             'train_epoch_time':    epoch_time,
+            'train_fetch_time':    float('nan'),
+            'train_h2d_time':      float('nan'),
+            'train_epoch_wall_time': float('nan'),
             'eval_time':           float('nan'),
         }
-        if loader_timing is not None:
+        if loader_timing:
             record.update(loader_timing)
 
         # For SGCN, add detailed timing fields from the parallel-pipeline model.
