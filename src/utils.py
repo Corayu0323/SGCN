@@ -12,10 +12,19 @@ from .models import GNN_PyG
 def apply_ood_perturbation(data, Pood, Pcr, seed):
     """Apply node-level OOD perturbation.
 
-    First, select anomalous nodes with Bernoulli(Pood). For every selected
-    node, all its original incident edges are removed. Then new neighbors are
-    sampled with Bernoulli(Pcr) from non-self, non-original-neighbor
-    candidates and used to reconnect the selected node.
+    Semantics (per selected node i):
+      1) Select anomalous nodes with Bernoulli(Pood).
+      2) Remove ALL original incident edges of i.
+      3) Reconnect to *original-neighbor candidates* with probability Pcr.
+
+    Important: "周围的邻居" here is interpreted as the *original* neighbors of the
+    node (the neighborhood before disconnect). If you want to reconnect to
+    non-neighbors (random nodes), you should instead sample from the complement
+    set.
+
+    For dense graphs (e.g., ogbn-proteins), sampling from non-neighbors can be
+    extremely weak because there are very few non-neighbor candidates; in that
+    case the perturbation barely changes the graph and ROC may not move.
     """
     if not (0.0 <= Pood <= 1.0):
         raise ValueError(f'Pood must be in [0, 1], got {Pood}')
@@ -157,21 +166,17 @@ def apply_ood_perturbation(data, Pood, Pcr, seed):
             added_per_node[node] = 0
             continue
 
+        # Original neighbors of this node (before removing edges)
         neighbors = torch.where(u[incident_ids] == node, v[incident_ids], u[incident_ids])
-        candidate_mask = torch.ones(num_nodes, dtype=torch.bool, device=device)
-        candidate_mask[node] = False
-        candidate_mask[neighbors] = False
-        candidates = candidate_mask.nonzero(as_tuple=False).squeeze(1)
-        if candidates.numel() == 0:
-            added_per_node[node] = 0
-            continue
 
-        sampled_mask = torch.rand(candidates.numel(), generator=generator, device=device) < Pcr
-        new_neighbors = candidates[sampled_mask]
+        # Reconnect to these original neighbors with probability Pcr
+        sampled_mask = torch.rand(neighbors.numel(), generator=generator, device=device) < Pcr
+        new_neighbors = neighbors[sampled_mask]
         if new_neighbors.numel() == 0:
             added_per_node[node] = 0
             continue
 
+        # Ensure undirected upper-triangular representation (min, max)
         node_vec = torch.full((new_neighbors.numel(),), node, dtype=torch.long, device=device)
         add_u = torch.minimum(node_vec, new_neighbors)
         add_v = torch.maximum(node_vec, new_neighbors)
