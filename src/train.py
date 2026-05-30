@@ -30,6 +30,13 @@ _SGCN_MIN_TRAIN_NODES = 32
 # Number of validation nodes sampled for the per-subgraph quality score
 _SGCN_VAL_SAMPLE_SIZE = 512
 _FISHER_TRACE_EPSILON = 1e-8
+_SAINT_BATCH_DIVISOR = 20
+_SAINT_MIN_BATCH_SIZE = 4096
+_SAINT_WALK_LENGTH = 3
+_SAINT_STEP_MULTIPLIER = 4
+_SAINT_MIN_STEPS = 20
+_SAINT_MAX_STEPS = 200
+_SAINT_SAMPLE_COVERAGE = 100
 
 
 def compute_fisher_trace(model, dataloader):
@@ -1063,6 +1070,8 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     data_eval = data if data_eval is None else data_eval
 
     if mpnn == 'graphsaint':
+        if len(train_idx) == 0:
+            raise ValueError("GraphSAINT requires a non-empty training index.")
         # Attach boolean split masks to data so GraphSAINT batches inherit them.
         data_train.train_mask = torch.zeros(data_train.num_nodes, dtype=torch.bool)
         data_train.train_mask[train_idx] = True
@@ -1071,15 +1080,26 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
         data_train.test_mask = torch.zeros(data_train.num_nodes, dtype=torch.bool)
         data_train.test_mask[test_idx] = True
 
-        # GraphSAINT: sample random-walk-induced subgraphs instead of
-        # per-node neighborhoods.  num_steps mirrors the ~10 batches/epoch
-        # produced by NeighborLoader, and walk_length provides a 2-hop reach.
-        saint_num_steps = max(len(train_idx) // train_batch_size, 1)
+        # GraphSAINT: use denser random-walk coverage, aligned with GraphSAINT
+        # OGB recipes that rely on larger coverage and normalisation sampling.
+        # Keep batches large enough for stable subgraph statistics while
+        # capping by available train nodes.
+        saint_min_batch = max(len(train_idx) // _SAINT_BATCH_DIVISOR, _SAINT_MIN_BATCH_SIZE)
+        saint_batch_size = min(len(train_idx), saint_min_batch)
+        saint_walk_length = _SAINT_WALK_LENGTH
+        saint_base_steps = max(math.ceil(len(train_idx) / saint_batch_size), 1)
+        # Use ~4x coverage of one-pass batches, but clamp runtime to a practical
+        # range so very small/large splits stay stable.
+        saint_num_steps = min(
+            max(saint_base_steps * _SAINT_STEP_MULTIPLIER, _SAINT_MIN_STEPS),
+            _SAINT_MAX_STEPS,
+        )
         train_loader = GraphSAINTRandomWalkSampler(
             data_train,
-            batch_size=train_batch_size,
-            walk_length=2,
+            batch_size=saint_batch_size,
+            walk_length=saint_walk_length,
             num_steps=saint_num_steps,
+            sample_coverage=_SAINT_SAMPLE_COVERAGE,
             num_workers=4,
         )
     elif mpnn == 'sgcn':
