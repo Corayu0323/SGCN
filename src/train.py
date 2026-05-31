@@ -32,6 +32,12 @@ _SGCN_VAL_SAMPLE_SIZE = 512
 _FISHER_TRACE_EPSILON = 1e-8
 
 
+def _sgcn_get_val_sample_size(val_idx_dev):
+    if val_idx_dev is None:
+        return 0
+    return min(_SGCN_VAL_SAMPLE_SIZE, len(val_idx_dev))
+
+
 def compute_fisher_trace(model, dataloader):
     """Return empirical Fisher trace from cached grad-squared statistics.
 
@@ -402,8 +408,12 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     train_idx_dev = train_idx.to(device)
     val_idx_dev = None
     if aggregation_method != 'fisher':
-        if val_idx is None:
-            raise ValueError("val_idx must be provided when aggregation_method is not 'fisher'")
+        if val_idx is None or len(val_idx) == 0:
+            raise ValueError(
+                "val_idx must be a non-empty tensor when aggregation_method is not 'fisher'"
+            )
+        val_idx_dev = val_idx.to(device)
+    elif val_idx is not None and len(val_idx) > 0:
         val_idx_dev = val_idx.to(device)
 
     n_nodes       = data.num_nodes
@@ -431,7 +441,7 @@ def train_epoch_sgcn(model, data, criterion, optimizer, device,
     loss_sum      = 0.0
     valid_batches = 0
 
-    val_sample_size = min(_SGCN_VAL_SAMPLE_SIZE, len(val_idx_dev))
+    val_sample_size = _sgcn_get_val_sample_size(val_idx_dev)
 
     # Per-subgraph timing lists (index r corresponds to subgraph r).
     subgraph_sampling_times = []
@@ -1064,6 +1074,9 @@ def run(data, labels, train_idx, val_idx, test_idx, evaluator, n_running,
     train_batch_size = (len(train_idx) + 9) // 10
     data_train = data if data_train is None else data_train
     data_eval = data if data_eval is None else data_eval
+
+    if mpnn == 'sgcn' and val_idx is None:
+        raise ValueError("val_idx must be provided when mpnn='sgcn'")
 
     if mpnn == 'graphsaint':
         # Attach boolean split masks to data so GraphSAINT batches inherit them.
