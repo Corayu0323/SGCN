@@ -32,7 +32,7 @@ bash install_a100_env.sh
 conda activate sgcn-a100
 ```
 
-更多参数见：`/tmp/workspace/Corayu0323/SGCN/A100_ENVIRONMENT.md`
+更多参数见：`A100_ENVIRONMENT.md`
 
 ### 方式 2：手动安装（最小依赖）
 
@@ -68,14 +68,15 @@ pip install torch torch_geometric ogb pandas matplotlib pyyaml
 PygNodePropPredDataset(name=dataset_name, root='/mnt/SGCN/dataset')
 ```
 
-如果你的数据目录不同，请修改该路径，或将数据准备到对应位置。
+这是代码中的默认绝对路径，不要求必须使用该目录。  
+如果你的数据目录不同（例如仓库内 `./dataset`），请修改该路径，或将数据准备到对应位置。
 
 ## 评估与分析脚本
 
 ### 1) True Path Rule (TPR) Violation
 
 ```bash
-python /tmp/workspace/Corayu0323/SGCN/src/evaluation.py --split test
+python src/evaluation.py --split test
 ```
 
 常用参数：
@@ -88,7 +89,7 @@ python /tmp/workspace/Corayu0323/SGCN/src/evaluation.py --split test
 ### 2) FP/FN 错误分析
 
 ```bash
-python /tmp/workspace/Corayu0323/SGCN/src/error_analysis.py --split test --threshold 0.5 --top-k 20
+python src/error_analysis.py --split test --threshold 0.5 --top-k 20
 ```
 
 可选参数：
