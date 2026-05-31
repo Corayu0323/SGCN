@@ -279,9 +279,12 @@ def preprocess(data, train_idx, n_classes):
                 dim_size=data.num_nodes, reduce='sum')
     data.x = x
 
-    # Training labels as additional input features (others stay zero)
-    data.train_labels_onehot = torch.zeros(data.num_nodes, n_classes)
-    data.train_labels_onehot[train_idx, data.y[train_idx, 0].long()] = 1
+    # ogbn-proteins is multi-label: keep full label vectors for train nodes
+    # only, and keep non-train nodes at zero to avoid label leakage.
+    data.train_labels_onehot = torch.zeros(
+        data.num_nodes, n_classes, dtype=torch.float
+    )
+    data.train_labels_onehot[train_idx] = data.y[train_idx].float()
     return data
 
 
